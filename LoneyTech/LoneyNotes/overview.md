@@ -30,7 +30,7 @@ LangAlpha 是一个基于**程序化工具调用 (PTC)** 模式的金融研究�
    - **提示**: `src/ptc_agent/agent/prompts/templates/` 的 Jinja2 模板
    - **长期记忆**: LangGraph `BaseStore` 按代理层级
    - **备忘录存储**: 用户上传的文档，存储在 S3 兼容存储
-   - ** scratchpad**: 每个线程的 `.agents/scratchpad/<thread-id>/` 文件夹
+   - **scratchpad**: 每个线程的 `.agents/scratchpad/<thread-id>/` 文件夹
    - **线程transcripts**: JSONL 存储在 `thread_transcripts` 字节列中
 
 6. **文件安装 (FUSE)**
