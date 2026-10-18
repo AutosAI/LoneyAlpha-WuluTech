@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 from psycopg.errors import CheckViolation, StringDataRightTruncation
@@ -18,6 +20,7 @@ from tests.unit.server.services.automations.file._support import (
     CALL,
     CREATED,
     FOREIGN_WORKSPACE,
+    HOME,
     NEW,
     NEW_FILE_NAME,
     NEW_PATH,
@@ -27,6 +30,7 @@ from tests.unit.server.services.automations.file._support import (
     PATH,
     UNKNOWN_THREAD,
     USER,
+    WORKSPACE,
     _create,
     _once_row,
     _other_row,
@@ -312,3 +316,68 @@ class TestDeliveryNote:
         report = await _create(backend, {**NEW, "delivery": ["slack"]})
 
         assert report.splitlines()[1].startswith("Note: Delivery was saved")
+
+
+_USER_WRITES = "hashtext(%s::text)"
+_ROW_LOCK = "FOR UPDATE"
+
+
+def _locks(db) -> list[str]:
+    """The locks the save took, in order: the user's write lock and the row's."""
+    return [
+        "user" if _USER_WRITES in sql else "row"
+        for sql in db.sql
+        if _USER_WRITES in sql or _ROW_LOCK in sql
+    ]
+
+
+class TestLockOrder:
+    """An update may make the user's Home, which takes the user's write lock;
+    a fold of a former Home takes that lock before the automation rows it
+    moves. The save takes it before its row too, or the two deadlock."""
+
+    @pytest.mark.asyncio
+    async def test_an_update_takes_the_users_write_lock_before_its_row(self, db, backend):
+        db.add(_row())
+
+        await _write(backend, {**_shown(_row()), "instruction": "Summarize the news."})
+
+        assert _locks(db) == ["user", "row"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "change", [{"status": "paused"}, {"status": "deleted"}], ids=["pause", "delete"]
+    )
+    async def test_a_save_that_cannot_make_home_takes_only_its_row(self, db, backend, change):
+        db.add(_row())
+
+        await _write(backend, {**_shown(_row()), **change})
+
+        assert _locks(db) == ["row"]
+
+    @pytest.mark.asyncio
+    async def test_home_made_in_a_save_is_made_on_its_connection_after_both_locks(
+        self, db, backend, monkeypatch
+    ):
+        """A move to Home makes Home when the user has none yet."""
+        db.add(_row(workspace_id=UUID(WORKSPACE)))
+        homes: list[Any] = []
+
+        async def no_home_yet(workspace_id: str, conn: Any = None) -> None:
+            return None
+
+        async def make_home(user_id: str, conn: Any = None) -> dict[str, Any]:
+            homes.append(conn)
+            db.sql.append("make home")
+            return {"workspace_id": HOME, "user_id": user_id}
+
+        monkeypatch.setattr(lifecycle, "get_workspace", no_home_yet)
+        monkeypatch.setattr(lifecycle, "get_or_create_home_workspace", make_home)
+
+        await _write(backend, {**_shown(db.list()[0]), "workspace_id": "home"})
+
+        assert homes == [db.conn]
+        made = db.sql.index("make home")
+        assert _locks(db) == ["user", "row"]
+        assert all(made > i for i, sql in enumerate(db.sql) if _USER_WRITES in sql or _ROW_LOCK in sql)
+        assert db.rows[BRIEF]["workspace_id"] == UUID(HOME)

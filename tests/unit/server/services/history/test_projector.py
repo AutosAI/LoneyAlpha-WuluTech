@@ -598,6 +598,82 @@ def test_unstamped_subagent_followup_falls_back_to_content():
     assert items[0]["data"]["count"] == 1
 
 
+def test_delivered_entries_keep_their_request_key_and_origin():
+    """The client settles its optimistic steer by ``request_key`` and labels
+    an agent's by ``origin``, so a replayed entry carries both as the live
+    one did."""
+    delivered = {
+        "count": 1,
+        "messages": [
+            {
+                "content": "do x",
+                "user_id": "u-1",
+                "timestamp": 1.0,
+                "origin": {"type": "agent", "agent": "chief_of_staff"},
+            },
+            {
+                "content": "stop that",
+                "user_id": "u-1",
+                "timestamp": 1.5,
+                "platform": "telegram",
+                "request_key": "rk-1",
+            },
+        ],
+        "timestamp": 2.0,
+    }
+    items = _sse(
+        [
+            HumanMessage(
+                content="[Steering from Chief of Staff]\ndo x",
+                id="h-s",
+                additional_kwargs={
+                    "lc_source": "steering",
+                    "steering_delivered": delivered,
+                },
+            )
+        ]
+    )
+
+    (item,) = items
+    assert item["event"] == "steering_delivered"
+    cos, user = item["data"]["messages"]
+    assert cos["origin"] == {"type": "agent", "agent": "chief_of_staff"}
+    assert user["request_key"] == "rk-1"
+    assert user["platform"] == "telegram"
+
+
+def test_a_resumed_task_run_opens_with_its_delivered_steers():
+    """A task resumed with steers its last run never read opens with them as
+    an unmarked input (it still opens a run); replay shows them delivered,
+    as the live stream did, not as a typed user message."""
+    delivered = {
+        "content": "add sources",
+        "count": 1,
+        "input_ids": ["in-1"],
+        "entries": [{"input_id": "in-1", "content": "add sources"}],
+    }
+    items = _sse(
+        [
+            HumanMessage(
+                content="add sources",
+                id="h-r",
+                additional_kwargs={"steering_delivered": delivered},
+            )
+        ],
+        agent="task:abc",
+    )
+
+    assert [i["event"] for i in items] == ["steering_delivered"]
+    assert items[0]["data"]["agent"] == "task:abc"
+    assert items[0]["data"]["input_ids"] == ["in-1"]
+
+
+def test_a_plain_task_input_still_projects_as_a_user_message():
+    items = _sse([HumanMessage(content="research X", id="h-t")], agent="task:abc")
+
+    assert [i["event"] for i in items] == ["user_message"]
+
+
 def test_summary_message_projects_summarize_complete():
     from ptc_agent.agent.middleware.compaction.utils import build_summary_message
     from ptc_agent.agent.transcript import TranscriptTarget
@@ -638,6 +714,91 @@ def test_token_usage_projected_after_message_content():
     assert data["input_tokens"] == 900
     assert data["output_tokens"] == 100
     assert data["total_tokens"] == 1000
+    # Saved before the stamp: replay fills in the deployment default.
+    assert "threshold" not in data
+
+
+def test_token_usage_carries_the_threshold_its_call_ran_under():
+    # The turn's own preset, not the deployment default: the threshold is per
+    # turn and only the checkpoint outlives it.
+    from ptc_agent.agent.middleware.compaction.utils import stamp_context_threshold
+
+    message = AIMessage(
+        content="answer",
+        id="ai-1",
+        usage_metadata={"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+    )
+    stamp_context_threshold(message, 300000)
+    items = _sse([message])
+    assert items[1]["data"]["threshold"] == 300000
+
+
+def _compacted(message, summary_id, text="condensed", count=30):
+    """``message`` as the response to a call that compacted to ``summary_id``."""
+    from ptc_agent.agent.middleware.compaction.utils import stamp_compaction_summary
+
+    stamp_compaction_summary(
+        message,
+        summary_id,
+        {
+            "summary_length": len(text),
+            "original_message_count": count,
+            "summary_text": text,
+            "source": "model",
+        },
+    )
+    return message
+
+
+def test_a_compacted_calls_summary_replays_right_before_its_response():
+    # Live, the summarize signal fires before the compacted call streams, so
+    # it sits between that call and the one before it.
+    first = AIMessage(
+        content="before",
+        id="ai-1",
+        usage_metadata={"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+    )
+    second = _compacted(AIMessage(content="after", id="ai-2"), "sum-1")
+
+    items = _sse([first, second], agent="task:t1")
+
+    assert [(i["event"], i["data"].get("action")) for i in items] == [
+        ("message_chunk", None),
+        ("context_window", "token_usage"),
+        ("context_window", "summarize"),
+        ("message_chunk", None),
+    ]
+    assert items[2]["data"] == {
+        "thread_id": THREAD_ID,
+        "agent": "task:t1",
+        "action": "summarize",
+        "signal": "complete",
+        "summary_length": len("condensed"),
+        "summary_text": "condensed",
+        "original_message_count": 30,
+        "source": "model",
+    }
+
+
+def test_a_summary_replayed_inline_does_not_also_open_the_span():
+    from ptc_agent.agent.middleware.compaction.utils import build_summary_message
+    from src.server.services.history.projector import context_signal_items
+    from src.server.services.history.slices import SpanDelta
+
+    summary = build_summary_message("condensed", None, original_message_count=30)
+    stamped = SpanDelta(
+        messages=[_compacted(AIMessage(content="after", id="ai-2"), summary.id)],
+        new_summarization_event={"summary_message": summary, "cutoff_index": 3},
+    )
+    # Saved before the stamp: the state diff is all there is.
+    unstamped = SpanDelta(
+        messages=[AIMessage(content="after", id="ai-2")],
+        new_summarization_event={"summary_message": summary, "cutoff_index": 3},
+    )
+
+    assert context_signal_items(THREAD_ID, stamped) == []
+    (item,) = context_signal_items(THREAD_ID, unstamped)
+    assert item["data"]["summary_text"] == "condensed"
 
 
 def test_workflow_run_items_whitelists_fields_and_sanitizes_errors():

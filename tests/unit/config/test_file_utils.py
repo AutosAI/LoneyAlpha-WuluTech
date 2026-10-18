@@ -167,7 +167,7 @@ class TestLoadYamlConfig:
 
 
 class TestAppEnvOverlay:
-    BASE = "llm:\n  name: base\n  flash: base-flash\n  fallback: [one, two]\nsearch_api: tavily\n"
+    BASE = "llm:\n  name: base\n  background: base-bg\n  fallback: [one, two]\nsearch_api: tavily\n"
 
     def _write(self, tmp_path, overlay=None):
         clear_config_cache()
@@ -183,7 +183,7 @@ class TestAppEnvOverlay:
             result = load_yaml_config(base)
 
         assert result["search_api"] == "serper"
-        assert result["llm"] == {"name": "overlaid", "flash": "base-flash", "fallback": ["one", "two"]}
+        assert result["llm"] == {"name": "overlaid", "background": "base-bg", "fallback": ["one", "two"]}
 
     def test_overlay_lists_replace_rather_than_concatenate(self, tmp_path):
         base = self._write(tmp_path, "llm:\n  fallback: [three]\n")
@@ -224,6 +224,57 @@ class TestAppEnvOverlay:
         base = self._write(tmp_path, overlay)
 
         with patch.dict(os.environ, {"APP_ENV": "production"}), pytest.raises(ValueError, match="mapping"):
+            load_yaml_config(base)
+
+
+# ---------------------------------------------------------------------------
+# llm.flash, the Background model's old name, refused
+# ---------------------------------------------------------------------------
+
+
+class TestRefusedLlmFlash:
+    def _write(self, tmp_path, base, overlay=None):
+        clear_config_cache()
+        (tmp_path / AGENT_CONFIG_FILE).write_text(base)
+        if overlay is not None:
+            (tmp_path / "agent_config.production.yaml").write_text(overlay)
+        return str(tmp_path / AGENT_CONFIG_FILE)
+
+    def test_a_file_on_the_old_name_is_refused_naming_the_file(self, tmp_path):
+        base = self._write(tmp_path, "llm:\n  name: base\n  flash: old-bg\n")
+
+        with patch.dict(os.environ, {}, clear=True), pytest.raises(ValueError) as refused:
+            load_yaml_config(base)
+
+        assert str(refused.value) == f"llm.flash was renamed to llm.background (in {base})"
+
+    def test_an_overlay_on_the_old_name_is_refused_naming_the_overlay(self, tmp_path):
+        base = self._write(
+            tmp_path,
+            "llm:\n  name: base\n  background: base-bg\n",
+            "llm:\n  flash: overlay-bg\n",
+        )
+
+        with patch.dict(os.environ, {"APP_ENV": "production"}), pytest.raises(ValueError) as refused:
+            load_yaml_config(base)
+
+        assert "llm.flash was renamed to llm.background" in str(refused.value)
+        assert "agent_config.production.yaml" in str(refused.value)
+
+    def test_a_file_naming_both_is_refused_too(self, tmp_path):
+        base = self._write(tmp_path, "llm:\n  name: base\n  flash: old-bg\n  background: new-bg\n")
+
+        with patch.dict(os.environ, {}, clear=True), pytest.raises(ValueError, match="llm.flash was renamed"):
+            load_yaml_config(base)
+
+    @pytest.mark.parametrize(
+        "body",
+        ["llm: some-model\n", "llm:\n  name: base\n  background: bg\n", "search_api: tavily\n"],
+    )
+    def test_a_file_without_the_old_name_loads(self, tmp_path, body):
+        base = self._write(tmp_path, body)
+
+        with patch.dict(os.environ, {}, clear=True):
             load_yaml_config(base)
 
 

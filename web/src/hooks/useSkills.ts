@@ -38,10 +38,11 @@ export function invalidateSkillFanout(qc: QueryClient) {
   // Same reason as the MCP fanout: a plugin card's component chips are these
   // rows, so a delete or a customize here changes what the Plugins tab shows.
   qc.invalidateQueries({ queryKey: queryKeys.plugins.list() });
+  // The subagents list says which preferred skills are gone.
+  qc.invalidateQueries({ queryKey: queryKeys.subagents.all });
 }
 
 export function useSkills(
-  mode: string | null,
   opts: {
     includeDisabled?: boolean;
     workspaceId?: string | null;
@@ -50,8 +51,8 @@ export function useSkills(
 ) {
   const { includeDisabled = false, workspaceId = null, allScopes = false } = opts;
   return useQuery({
-    queryKey: queryKeys.skills.list(mode, includeDisabled, workspaceId, allScopes),
-    queryFn: () => getSkills({ mode, includeDisabled, workspaceId, allScopes }),
+    queryKey: queryKeys.skills.list(includeDisabled, workspaceId, allScopes),
+    queryFn: () => getSkills({ includeDisabled, workspaceId, allScopes }),
     staleTime: 60_000,
   });
 }

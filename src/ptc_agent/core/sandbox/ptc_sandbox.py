@@ -769,7 +769,11 @@ class PTCSandbox:
 
         if on_state_observed is not None:
             try:
-                on_state_observed(state_value)
+                # An archive in progress ends in a restore from archived, so it
+                # gets the same slow-restore notice.
+                on_state_observed(
+                    "archived" if state_value == "archiving" else state_value
+                )
             except Exception:
                 logger.debug(
                     "on_state_observed callback raised; ignoring",
@@ -865,6 +869,49 @@ class PTCSandbox:
             )
             await self._start_runtime(sandbox_id, self.runtime.start, timeout=300)
             _mark_rc("start_archived")
+        elif state_value == "archiving":
+            # Never started mid-archive: a start that lands once Daytona has
+            # removed the container errors the sandbox beyond recovery, which
+            # reads as gone and rebuilds it from the backup. Wait for the
+            # archive to land, then restore it like any archived sandbox.
+            logger.info(
+                "Sandbox is being archived, waiting before restore",
+                sandbox_id=sandbox_id,
+            )
+            # A deadline, not a poll count: each poll is also a provider read,
+            # and the restore after it has its own 300s budget.
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                self.runtime = await self._runtime_call(
+                    self.provider.get,
+                    sandbox_id,
+                    retry_policy=RetryPolicy.SAFE,
+                    allow_reconnect=False,
+                )
+                state = await self.runtime.get_state()
+                state_value = state.value
+                if state_value != "archiving":
+                    break
+            # A cancelled archive ends stopped, which starts like any other,
+            # or running, when something else already started it.
+            if state_value not in ("archived", "stopped", "running"):
+                # Still archiving is a sandbox that exists, so a retry, not a
+                # replacement; any other state is the next open's to handle.
+                logger.warning(
+                    "Sandbox did not finish archiving",
+                    sandbox_id=sandbox_id,
+                    state=state_value,
+                )
+                raise SandboxTransientError(
+                    f"Sandbox {sandbox_id} is being archived "
+                    f"(state '{state_value}' after ~45s); try again in a few minutes"
+                )
+            if state_value != "running":
+                await self._start_runtime(
+                    sandbox_id, self.runtime.start, timeout=300
+                )
+            _mark_rc("start_archiving")
         elif state_value == "error":
             # Restarting an errored sandbox the provider will not recover fails
             # the same way on every open, so the runtime answers Gone and the
@@ -1580,9 +1627,10 @@ class PTCSandbox:
         max_retries: int = 2,
         thread_id: str | None = None,
         call_id: str | None = None,
+        allowed_servers: frozenset[str] | None = None,
         _carry_mcp_trace: list[dict] | None = None,
     ) -> ExecutionResult:
-        return await _execution.execute(self, code, timeout, auto_install=auto_install, max_retries=max_retries, thread_id=thread_id, call_id=call_id, _carry_mcp_trace=_carry_mcp_trace)
+        return await _execution.execute(self, code, timeout, auto_install=auto_install, max_retries=max_retries, thread_id=thread_id, call_id=call_id, allowed_servers=allowed_servers, _carry_mcp_trace=_carry_mcp_trace)
 
     async def execute_bash_command(
         self,
@@ -1593,8 +1641,9 @@ class PTCSandbox:
         background: bool = False,
         thread_id: str | None = None,
         call_id: str | None = None,
+        allowed_servers: frozenset[str] | None = None,
     ) -> dict[str, Any]:
-        return await _execution.execute_bash_command(self, command, working_dir, timeout, background=background, thread_id=thread_id, call_id=call_id)
+        return await _execution.execute_bash_command(self, command, working_dir, timeout, background=background, thread_id=thread_id, call_id=call_id, allowed_servers=allowed_servers)
 
     def _build_trace_env_command(
         self,
@@ -1603,9 +1652,10 @@ class PTCSandbox:
         call_id: str | None = None,
         trace_path: str | None = None,
         own_shell: bool = False,
+        allowed_servers: frozenset[str] | None = None,
     ) -> tuple[str, str]:
         return _execution._build_trace_env_command(
-            self, bash_id, full_command, call_id, trace_path, own_shell
+            self, bash_id, full_command, call_id, trace_path, own_shell, allowed_servers
         )
 
     # -- sessions --

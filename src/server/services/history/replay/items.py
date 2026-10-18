@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from src.server.contracts.status import TERMINAL_STATUSES
 from src.server.database.provenance import provenance_row_to_event
 from src.server.services.history.replay import facts as replay_facts
+from src.server.services.history.replay import legacy
 from src.server.services.history.replay import stopped
 from src.server.services.history.replay.lanes import MAIN_LANE, agent_lane
 from src.server.services.runs.credit_usage import build_credit_usage_data
@@ -147,20 +148,24 @@ def _insert_provenance_items(
     """Synthesize ``provenance`` events from table rows, anchored in position.
 
     Each row inserts after the ``tool_call_result`` matching its
-    ``tool_call_id`` (where the live event fired); rows with no matching
-    anchor in this projection append at the turn tail in row order.
+    ``tool_call_id`` (where the live event fired); rows whose call is not in
+    this projection append at the turn tail in row order. A row with no tool
+    call (a market-watch stamp) has only its time to go by, and so does a
+    subagent's: its lane replays after the whole main lane, while the client
+    hangs every record on the main bubble current when it arrives. See
+    ``_place_by_steer``.
     """
     if not rows:
         return turn_items
     by_anchor: dict[str, list[dict[str, Any]]] = {}
-    unanchored: list[dict[str, Any]] = []
+    unanchored: list[tuple[dict[str, Any], float | None]] = []
     for row in rows:
         item = {"event": "provenance", "data": provenance_row_to_event(row)}
         tool_call_id = item["data"].get("tool_call_id")
-        if tool_call_id:
+        if tool_call_id and agent_lane(item["data"].get("agent")) == MAIN_LANE:
             by_anchor.setdefault(tool_call_id, []).append(item)
         else:
-            unanchored.append(item)
+            unanchored.append((item, _arrival(row)))
 
     merged: list[dict[str, Any]] = []
     for item in turn_items:
@@ -169,8 +174,77 @@ def _insert_provenance_items(
             merged.extend(by_anchor.pop(item["data"].get("tool_call_id"), ()))
     for leftover in by_anchor.values():
         merged.extend(leftover)
-    merged.extend(unanchored)
+    return _place_by_steer(merged, unanchored)
+
+
+def _place_by_steer(
+    merged: list[dict[str, Any]],
+    unanchored: list[tuple[dict[str, Any], float | None]],
+) -> list[dict[str, Any]]:
+    """Put each row placed by its time in the bubble it reached live.
+
+    Live, a record lands in whatever bubble the turn is writing, and a
+    delivered steer opens a new one. A market-watch stamp is emitted at the
+    model call it feeds, which runs after the steer that call reads, so a
+    row that arrived before a steer belongs in the bubble that steer closed:
+    it goes just ahead of it. A row that arrived after every steer, or has
+    no time at all, stays at the tail. A throttled replay of a market-watch
+    block reuses its fetch time; but such a replay carries the same content
+    and is the same row, so the row sits where the block was first shown.
+    """
+    if not unanchored:
+        return merged
+    steers = [
+        (index, at)
+        for index, item in enumerate(merged)
+        if item["event"] == "steering_delivered"
+        and agent_lane(item["data"].get("agent")) == MAIN_LANE
+        and (at := _epoch(item["data"].get("timestamp"))) is not None
+    ]
+    before: dict[int, list[dict[str, Any]]] = {}
+    tail: list[dict[str, Any]] = []
+    for item, at in unanchored:
+        index = next(
+            (i for i, steer_at in steers if at is not None and at < steer_at), None
+        )
+        if index is None:
+            tail.append(item)
+        else:
+            before.setdefault(index, []).append(item)
+    if before:
+        placed: list[dict[str, Any]] = []
+        for index, item in enumerate(merged):
+            placed.extend(before.get(index, ()))
+            placed.append(item)
+        merged = placed
+    merged.extend(tail)
     return merged
+
+
+def _arrival(row: dict[str, Any]) -> float | None:
+    """When a row's record reached the client: its ``emitted_at``, or for a
+    row written before that was kept, its fetch time. The fetch can be well
+    before: code in the sandbox reports what it fetched only when it
+    returns."""
+    emitted = _epoch(row.get("emitted_at"))
+    return emitted if emitted is not None else _epoch(row.get("source_timestamp"))
+
+
+def _epoch(value: Any) -> float | None:
+    """Seconds since the epoch from a row's datetime, an ISO string, or the
+    float a steer payload stamps; None for anything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return None
 
 
 _CREDIT_USAGE_STATUSES = ("completed", "interrupted")
@@ -259,17 +333,21 @@ def terminal_items(
     A client shows one failure per turn (the web the last error, older
     clients the first), and the ``error`` frame the user saw has the model,
     hints and words the row lacks. So a failed turn replays that frame with
-    the row's kind stamped on it: in place, when an older turn's stored
-    events hold it, or as its row's replay facts kept it. Only a failure
-    that sent no frame (its stream quota spent, a fault outside the
-    producer) gets the row's own item. Both read ``turn_items``, so the
-    caller appends after.
+    the row's kind stamped on it: in place, when a legacy turn's facts
+    placed its archived copy, or as its row's replay facts kept it or its
+    archive held it (a stub places no facts). Only a failure that sent no
+    frame (its stream quota spent, a fault outside the producer) gets the
+    row's own item. Both read ``turn_items``, so the caller appends after.
     """
     stop = stopped.stop_close_item(thread_id, response, turn_items)
     error = _error_item(thread_id, response)
     if error is not None:
         stored = _stored_error(turn_items)
-        frame = stored or replay_facts.error_frame(thread_id, response)
+        frame = (
+            stored
+            or replay_facts.error_frame(thread_id, response)
+            or legacy.archived_error(thread_id, response)
+        )
         if frame is not None:
             _stamp_row_kind(frame["data"], error["data"])
             error = None if stored else frame
@@ -311,31 +389,3 @@ def _enrich(
     if response_id is not None:
         data["response_id"] = response_id
 
-
-def _stub_turn_items(
-    thread_id: str,
-    turn_index: Any,
-    queries_by_turn: dict[Any, list[dict[str, Any]]],
-    responses_by_turn: dict[Any, dict[str, Any]],
-    open_run: str | None = None,
-) -> list[dict[str, Any]]:
-    """A persisted turn with no committed boundary: the in-flight active turn
-    (frontend attaches to the live run via /status + run_id, ``open_run``) or
-    a run that never checkpointed. The user_message stub, plus the terminal
-    error or stop close the response row records, is the whole replay. Never
-    cached.
-
-    Output the turn streamed before it stopped or failed is not on the
-    committed branch, so it is not in the model's context either, and replay
-    leaves it out.
-    """
-    response = responses_by_turn.get(turn_index)
-    response_id = str(response.get("conversation_response_id")) if response else None
-    items = [
-        _user_message_item(thread_id, q, response, open_run)
-        for q in queries_by_turn.get(turn_index, [])
-    ]
-    turn_items = terminal_items(thread_id, response, [])
-    for item in turn_items:
-        _enrich(item, thread_id, turn_index, response_id)
-    return items + turn_items

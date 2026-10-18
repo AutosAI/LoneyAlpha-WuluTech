@@ -3,6 +3,7 @@ import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
+import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { CACHE_ONLY_META, queryKeys } from '../../../lib/queryKeys';
 import { createEmitter } from '@/lib/emitter';
 import { isArchivedThreadsKey, patchThreadRows, rollbackThreadRows } from '@/lib/threadRowActions';
@@ -14,7 +15,7 @@ import {
   type ThreadRecord,
   type ThreadsData,
 } from '@/lib/navThreadsStore';
-import type { ResourceTier, ThreadsResponse, WorkspacesResponse } from '@/types/api';
+import type { ResourceTier, ThreadsResponse, Workspace, WorkspacesResponse } from '@/types/api';
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
 import { workspaceThreadsQuery } from '../utils/threadQueries';
 import { pinWorkspaceRow, renameWorkspaceRow } from './workspaceRowActions';
@@ -26,7 +27,7 @@ import { denialMessage } from '../utils/denialMessage';
  * options menu render, plus the loose tail the list endpoint carries. Exported
  * so hosts render the tree without re-casting the hook's output.
  */
-export interface NavWorkspace {
+export interface NavWorkspace extends Pick<Workspace, 'is_home'> {
   workspace_id: string;
   name?: string;
   status?: string;
@@ -41,7 +42,7 @@ export interface NavWorkspace {
 // the hook rather than reaching into the store module.
 export type { ThreadRecord, ThreadsData } from '@/lib/navThreadsStore';
 
-const NAV_WS_PARAMS = { limit: 20, includeFlash: true };
+const NAV_WS_PARAMS = { limit: 20, includeHome: true };
 
 // Session-stable nav ordering. The server sorts threads (and, within the
 // 'custom' workspace sort, unpinned workspaces) by updated_at DESC, so the item
@@ -178,17 +179,17 @@ export function applyStableOrder(
 }
 
 // The workspace ordering rule: an unpinned workspace never renders above a
-// pinned one, and Flash counts as always-pinned — it can't be assumed to
+// pinned one, and Home counts as always-pinned. It can't be assumed to
 // carry is_pinned in every deployment, and pinned workspaces may still
 // outrank it inside the pinned block (by sort_order/recency).
-export function isEffectivelyPinned(ws: { workspace_id?: unknown; is_pinned?: unknown; status?: unknown }): boolean {
-  return Boolean(ws.is_pinned) || ws.status === 'flash';
+export function isEffectivelyPinned(ws: Pick<Workspace, 'is_home'> & { is_pinned?: unknown }): boolean {
+  return Boolean(ws.is_pinned) || isHomeWorkspace(ws);
 }
 
 /**
  * Put the unpinned workspaces the server lists above every known unpinned one
  * at the top of the frozen order. `applyStableOrderBy` tops only rows above
- * every known row, and the pinned block (Flash included) always leads the
+ * every known row, and the pinned block (Home included) always leads the
  * list, so a workspace created this session sank below the rest instead of
  * opening the unpinned block, where a reload shows it. Rows paged in later
  * still come below the known ones.
@@ -326,10 +327,10 @@ export function useNavigationData(currentWorkspaceId: string) {
       ordered = allFetched;
     }
 
-    // Pinned block first (Flash counts as always-pinned), preserving relative
+    // Pinned block first (Home counts as always-pinned), preserving relative
     // order within each block — the workspace-tier partitionPinnedFirst. The
     // sources can't guarantee the invariant on their own: the frozen snapshot
-    // may predate a pin flip, and a flash row isn't guaranteed is_pinned in
+    // may predate a pin flip, and Home isn't guaranteed is_pinned in
     // the DB. Render-time (not baked into the freeze) so an optimistic pin
     // patch repositions the row instantly, like the thread partition.
     const pinnedBlock: NavWorkspace[] = [];
@@ -357,7 +358,7 @@ export function useNavigationData(currentWorkspaceId: string) {
   // workspace gallery's 'custom' sort shows the same arrangement. Mirrors the
   // gallery's reorder-mode rules: crossing the pinned/unpinned boundary is
   // refused (the server sort would undo it — is_pinned DESC dominates
-  // sort_order); flash counts as pinned and reorders within that block.
+  // sort_order); Home counts as pinned and reorders within that block.
   const reorderWorkspace = useCallback(async (activeId: string, overId: string) => {
     const frozen = _frozenWorkspaceOrder;
     if (!frozen || !activeId || !overId || activeId === overId) return;
@@ -365,7 +366,7 @@ export function useNavigationData(currentWorkspaceId: string) {
     const active = byId.get(activeId);
     const over = byId.get(overId);
     if (!active || !over) return;
-    // No flash special case: it counts as pinned, so this boundary guard
+    // No Home special case: it counts as pinned, so this boundary guard
     // both contains it in the pinned block and keeps unpinned rows out.
     if (isEffectivelyPinned(active) !== isEffectivelyPinned(over)) return;
     const fromIdx = frozen.indexOf(activeId);
@@ -377,10 +378,10 @@ export function useNavigationData(currentWorkspaceId: string) {
     frozen.splice(toIdx, 0, activeId);
     bumpNavOrder();
 
-    // Flash is included: it's DB-pinned with a real sort_order, and writing
-    // its slot is what makes "pinned workspace above/below Flash" stick —
-    // omitting it leaves a sort_order tie decided by updated_at, so the
-    // pinned block would reshuffle whenever Flash is used.
+    // Home is included: it's DB-pinned with a real sort_order, and writing
+    // its slot is what makes "pinned workspace above/below Home" stick.
+    // Omitting it leaves a sort_order tie decided by updated_at, so the
+    // pinned block would reshuffle whenever Home is used.
     const items = frozen
       .map((id) => byId.get(id))
       .filter((ws): ws is NavWorkspace => !!ws)

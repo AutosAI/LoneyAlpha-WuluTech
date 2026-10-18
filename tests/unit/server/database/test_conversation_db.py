@@ -8,6 +8,7 @@ thread sharing, and pagination logic.
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import psycopg
 import pytest
@@ -90,7 +91,6 @@ def _response_row(response_id=None, thread_id="t-1", turn_index=0, **overrides):
         "errors": [],
         "execution_time": 1.5,
         "created_at": now,
-        "sse_events": None,
     }
     row.update(overrides)
     return row
@@ -190,6 +190,59 @@ async def test_create_thread_binds_the_switch_with_its_workspace(
     values = _insert_values(*mock_cursor.execute.call_args_list[-1].args)
     assert values["subagents_allowed"] == (allowed, "ws-1")
     assert values["platform"] == "telegram"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("named", "stored"),
+    [({}, "ptc"), ({"msg_type": "flash"}, "flash")],
+    ids=["omitted", "named"],
+)
+async def test_create_thread_stamps_the_full_agent_unless_told_otherwise(
+    mock_db_connection, mock_cursor, named, stored
+):
+    """No caller names the producer any more; the insert still writes 'ptc'."""
+    from src.server.database.conversation import create_thread
+
+    mock_cursor.fetchone.side_effect = [{"next_index": 0}, _thread_row()]
+
+    await create_thread(
+        conversation_thread_id="t-1",
+        workspace_id="ws-1",
+        current_status="in_progress",
+        **named,
+    )
+
+    values = _insert_values(*mock_cursor.execute.call_args_list[-1].args)
+    assert values["msg_type"] == stored
+
+
+@pytest.mark.asyncio
+async def test_a_thread_a_turn_creates_is_the_full_agents(
+    mock_db_connection, mock_cursor
+):
+    """ensure_thread_exists, which every send passes through, creates the row
+    as the full agent's without being told."""
+    from src.server.database.conversation import ensure_thread_exists
+
+    mock_cursor.fetchone.side_effect = [
+        {"workspace_id": "ws-1"},
+        None,
+        {"next_index": 0},
+        _thread_row(),
+    ]
+    cache = SimpleNamespace(enabled=False, client=None)
+    with patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache):
+        created = await ensure_thread_exists(
+            workspace_id="ws-1",
+            conversation_thread_id="t-1",
+            user_id="u-1",
+            initial_query="hello",
+        )
+
+    assert created is True
+    values = _insert_values(*mock_cursor.execute.call_args_list[-1].args)
+    assert values["msg_type"] == "ptc"
 
 
 @pytest.mark.asyncio
@@ -379,53 +432,26 @@ async def test_thread_model_writers_never_touch_updated_at(
 
 
 @pytest.mark.asyncio
-async def test_reassign_thread_models_moves_each_mode_off_its_old_default(
+async def test_reassign_thread_models_moves_threads_off_the_old_default(
     mock_db_connection, mock_cursor
 ):
-    """One statement for both modes: a flash thread is ``msg_type = 'flash'``;
-    anything else (including NULL) runs PTC turns. Only threads on exactly the
-    old name move, and a mode with no move compares against NULL."""
+    """Only threads on exactly the old name move, whatever their type."""
     from src.server.database.conversation.threads_write import (
         reassign_thread_llm_models,
     )
 
     mock_cursor.rowcount = 4
-    moved = await reassign_thread_llm_models(
-        "u-1", {"ptc": ("m-a", "m-b"), "flash": ("m-f", None)}
-    )
+    moved = await reassign_thread_llm_models("u-1", "m-a", "m-b")
 
     assert moved == 4
     mock_cursor.execute.assert_called_once()
     sql, params = mock_cursor.execute.call_args[0]
-    assert params == {
-        "user_id": "u-1",
-        "ptc_old": "m-a",
-        "ptc_new": "m-b",
-        "flash_old": "m-f",
-        "flash_new": None,
-    }
-    assert "WHEN t.msg_type = 'flash'" in sql
-    assert "t.llm_model = %(flash_old)s" in sql
-    assert "t.llm_model = %(ptc_old)s" in sql
+    assert params == {"user_id": "u-1", "old": "m-a", "new": "m-b"}
+    assert "t.llm_model = %(old)s" in sql
+    assert "msg_type" not in sql
     assert "w.user_id = %(user_id)s" in sql
     assert "w.status != 'deleted'" in sql
     assert "updated_at" not in sql
-
-    await reassign_thread_llm_models("u-1", {"ptc": ("m-a", "m-b")})
-    _, params = mock_cursor.execute.call_args[0]
-    assert params["flash_old"] is None and params["flash_new"] is None
-
-
-@pytest.mark.asyncio
-async def test_reassign_thread_models_with_no_moves_touches_nothing(
-    mock_db_connection, mock_cursor
-):
-    from src.server.database.conversation.threads_write import (
-        reassign_thread_llm_models,
-    )
-
-    assert await reassign_thread_llm_models("u-1", {}) == 0
-    mock_cursor.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -704,21 +730,6 @@ async def test_get_latest_turn_index_read_failure_is_none(mock_db_connection, mo
 # ===========================================================================
 # Response Tests
 # ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_get_responses_for_thread(mock_db_connection, mock_cursor):
-    """get_responses_for_thread returns responses and total count."""
-    from src.server.database.conversation import get_responses_for_thread
-
-    r1 = _response_row(turn_index=0)
-    mock_cursor.fetchone.return_value = {"total": 1}
-    mock_cursor.fetchall.return_value = [r1]
-
-    responses, total = await get_responses_for_thread("t-1")
-
-    assert total == 1
-    assert len(responses) == 1
 
 
 @pytest.mark.asyncio

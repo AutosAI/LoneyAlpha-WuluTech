@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.server.database.home_workspace import get_flash_workspace_id
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.runs.lifecycle import RunSlotBusyError
 from src.server.handlers.chat.admission_gate import (
     ADMISSION_CONFLICT_CODES,
@@ -33,11 +33,13 @@ from src.server.services.automation_settlement import (
     settle_abandoned,
 )
 from src.server.services.runs.admission import BUSY_STATES
+from src.server.services.turn_runtime import TurnRoute
 from src.server.services.writer_guard import WriterGuardUnavailable
 
 _MOD = "src.server.services.automation_executor"
 _USER = "user-1"
 _EXEC = "exec-1"
+_HOME = get_home_workspace_id(_USER)
 
 
 @pytest.mark.parametrize("state", sorted(BUSY_STATES))
@@ -59,10 +61,9 @@ def _automation(**overrides):
         "automation_id": "auto-1",
         "user_id": _USER,
         "name": "",
-        "agent_mode": "flash",
         "instruction": "Summarize the market",
         "trigger_type": "cron",
-        "workspace_id": None,
+        "workspace_id": _HOME,
         "thread_strategy": "new",
         "conversation_thread_id": None,
         "llm_model": None,
@@ -134,12 +135,14 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,)):
         patch(f"{_MOD}.has_any_oauth_token", new=AsyncMock(return_value=False)),
         patch(f"{_MOD}.enforce_credit_limit", new=fx.credit),
         patch(
-            "src.server.services.turn_runtime.home_enabled",
-            new=AsyncMock(return_value=False),
+            "src.server.database.workspace.get_workspace",
+            new=AsyncMock(
+                return_value={"workspace_id": _HOME, "user_id": _USER, "status": "running"}
+            ),
         ),
         patch(
-            "src.server.database.workspace.get_or_create_flash_workspace",
-            new=AsyncMock(return_value={"workspace_id": "ws-1"}),
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            return_value=MagicMock(ensure_home_bound=AsyncMock()),
         ),
         patch(f"{_MOD}.WebhookClient", return_value=MagicMock(fire_event=fx.started)),
         patch(
@@ -151,7 +154,6 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,)):
         patch(f"{_MOD}._thread_busy", new=AsyncMock(side_effect=lambda _: next(busy_answers, False))),
         patch(f"{_MOD}._WAIT_POLL_SECONDS", new=0),
         patch("src.server.database.runs.lifecycle.get_run", new=AsyncMock(side_effect=get_run)),
-        patch("src.server.handlers.chat.astream_flash_workflow", new=fx.astream),
         patch("src.server.handlers.chat.astream_ptc_workflow", new=fx.astream),
     ):
         yield fx
@@ -366,13 +368,11 @@ _DELIVERING = {"delivery_config": {"methods": ["slack:T/C"]}}
 
 
 @contextmanager
-def _delivery(*starts, home: bool = True):
+def _delivery(*starts):
     """The messaging service's start, answering each of ``starts`` in turn
     (None: it asked nothing), and its finish.
 
-    Entered after ``_firing``. With ``home``, an automation with no workspace
-    runs as the Chief of Staff in Home, as every account does once Flash is
-    gone; without, it runs on Flash, which the flag still allows.
+    Entered after ``_firing``.
     """
     fx = SimpleNamespace(
         start=AsyncMock(side_effect=list(starts)),
@@ -387,7 +387,6 @@ def _delivery(*starts, home: bool = True):
             "src.server.services.automation_settlement.automation_delivery.finish_run",
             new=fx.finish,
         ),
-        patch("src.server.services.turn_runtime.home_enabled", new=AsyncMock(return_value=home)),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
             return_value=fx.manager,
@@ -409,7 +408,7 @@ async def test_a_held_run_tells_its_agent_where_to_send():
         await AutomationExecutor().execute(automation, _EXEC)
 
     args = _turn_args(fx)
-    assert args["role"] == "chief_of_staff"
+    assert args["route"].role == "chief_of_staff"
     # The thread the run goes on, resolved before the start. Home is none of
     # the user's workspaces, so the run names none.
     assert args["thread_id"]
@@ -439,36 +438,9 @@ async def test_a_held_run_tells_its_agent_where_to_send():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "automation",
-    [
-        {"agent_mode": "flash"},
-        {"agent_mode": "ptc", "workspace_id": get_flash_workspace_id(_USER)},
-    ],
-    ids=["no_workspace", "in_home"],
-)
-async def test_a_run_in_home_names_no_workspace_to_the_service(automation):
-    """Whether the automation names Home or no workspace, an entry naming
-    only an app takes that app's preferred chat."""
-    home_id = get_flash_workspace_id(_USER)
-    home = {"workspace_id": home_id, "user_id": _USER, "status": "running"}
-    with (
-        _firing([_streams]) as fx,
-        _delivery(_HELD) as dx,
-        patch("src.server.database.workspace.get_workspace", new=AsyncMock(return_value=home)),
-    ):
-        await AutomationExecutor().execute(_automation(**_DELIVERING, **automation), _EXEC)
-
-    args = _turn_args(fx)
-    assert (args["workspace_id"], args["role"]) == (home_id, "chief_of_staff")
-    assert dx.start.await_args.args[2] is None
-    assert args["extra_configurable"] == automation_delivery.turn_configurable(_HELD)
-
-
-@pytest.mark.asyncio
 async def test_an_analysts_run_names_its_workspace_to_the_service():
     workspace = {"workspace_id": "ws-9", "user_id": _USER, "status": "running"}
-    automation = _automation(**_DELIVERING, agent_mode="ptc", workspace_id="ws-9")
+    automation = _automation(**_DELIVERING, workspace_id="ws-9")
     with (
         _firing([_streams]) as fx,
         _delivery(_HELD) as dx,
@@ -480,43 +452,9 @@ async def test_an_analysts_run_names_its_workspace_to_the_service():
         await AutomationExecutor().execute(automation, _EXEC)
 
     args = _turn_args(fx)
-    assert (args["workspace_id"], args["role"]) == ("ws-9", "analyst")
+    assert args["route"] == TurnRoute("ws-9", "analyst")
     dx.start.assert_awaited_once_with(automation, _EXEC, "ws-9", thread_id=args["thread_id"])
     assert args["extra_configurable"] == automation_delivery.turn_configurable(_HELD)
-
-
-@pytest.mark.asyncio
-async def test_a_run_on_flash_gets_flashs_own_arguments():
-    """Flash has no messaging tools, so its turn carries nothing for them,
-    and its workflow takes no argument for it."""
-    with _firing([_streams]) as fx, _delivery(_HELD, home=False) as dx:
-        await AutomationExecutor().execute(_automation(**_DELIVERING), _EXEC)
-
-    args = _turn_args(fx)
-    assert args["flash_workspace"] == {"workspace_id": "ws-1"}
-    assert "extra_configurable" not in args
-    assert dx.start.await_args.args[2] is None
-
-
-@pytest.mark.asyncio
-async def test_a_held_run_on_flash_is_not_told_to_send():
-    """A turn without send_message is never told to use it. The run stays
-    held, so its finish posts the answer to the targets."""
-    automation = _automation(
-        **_DELIVERING, additional_context=[{"type": "directive", "content": "Be brief."}]
-    )
-    with _firing([_streams]) as fx, _delivery(_HELD, home=False):
-        await AutomationExecutor().execute(automation, _EXEC)
-
-    args = _turn_args(fx)
-    assert "flash_workspace" in args
-    contexts = [(c.type, c.content) for c in args["request"].additional_context]
-    assert contexts == [("directive", "Be brief.")]
-    assert args["run_metadata"] == {
-        "automation_execution_id": _EXEC,
-        "automation_id": "auto-1",
-        **automation_delivery.run_metadata(_HELD),
-    }
 
 
 @pytest.mark.asyncio
@@ -628,7 +566,7 @@ async def test_a_credit_refusal_before_the_turn_ends_with_the_service():
 @pytest.mark.asyncio
 async def test_an_analysts_refusal_names_its_workspace_to_the_service():
     workspace = {"workspace_id": "ws-9", "user_id": _USER, "status": "running"}
-    automation = _automation(**_DELIVERING, agent_mode="ptc", workspace_id="ws-9")
+    automation = _automation(**_DELIVERING, workspace_id="ws-9")
     with (
         _firing([_streams]) as fx,
         _delivery(_HELD) as dx,
@@ -952,35 +890,22 @@ async def test_an_automation_turn_runs_its_own_model_not_the_threads(llm_model):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("flag", "agent", "role"),
-    [(False, "flash", None), (True, "ptc", "chief_of_staff")],
-    ids=["flag_off", "flag_on"],
-)
-async def test_a_chief_of_staff_automation_follows_the_flag(flag, agent, role):
-    """The Chief of Staff files its automations as PTC in Home.
-
-    With the flag off they run on Flash like every other turn there, so the
-    rollback starts no computer; they once went straight to the full agent.
-    """
-    home_id = get_flash_workspace_id(_USER)
-    home = {"workspace_id": home_id, "user_id": _USER, "status": "running", "computer_id": "c-1"}
+async def test_a_chief_of_staff_automation_runs_in_home():
+    """Home's row is a workspace row too, and an automation stored in it runs
+    there as the Chief of Staff, not as an analyst of that row."""
+    home = {"workspace_id": _HOME, "user_id": _USER, "status": "running", "computer_id": "c-1"}
     manager = MagicMock(ensure_home_bound=AsyncMock())
     with (
         _firing([_streams]) as fx,
-        patch("src.server.services.turn_runtime.home_enabled", new=AsyncMock(return_value=flag)),
         patch("src.server.database.workspace.get_workspace", new=AsyncMock(return_value=home)),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
             return_value=manager,
         ),
     ):
-        await AutomationExecutor().execute(
-            _automation(agent_mode="ptc", workspace_id=home_id), _EXEC
-        )
+        await AutomationExecutor().execute(_automation(workspace_id=_HOME), _EXEC)
 
     turn = fx.astream.call_args.kwargs
-    assert turn["request"].agent_mode == agent
-    assert turn["request"].workspace_id == home_id
-    assert turn.get("role") == role
-    assert manager.ensure_home_bound.await_count == int(flag)
+    assert turn["request"].workspace_id == _HOME
+    assert turn["route"] == TurnRoute(_HOME, "chief_of_staff")
+    manager.ensure_home_bound.assert_awaited_once_with(_USER)

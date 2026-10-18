@@ -358,10 +358,6 @@ def get_redis_ttl_cancel_flag() -> int:
     return get_infrastructure_config().redis.ttl.cancel_flag
 
 
-def get_redis_ttl_steering() -> int:
-    return get_infrastructure_config().redis.ttl.steering
-
-
 def get_market_watch_min_interval() -> int:
     return get_infrastructure_config().market_watch.min_interval_seconds
 
@@ -543,20 +539,9 @@ def get_config(
 # =============================================================================
 
 
-def get_langsmith_tags(
-    msg_type: str,
-    locale: Optional[str] = None,
-) -> List[str]:
-    """Build LangSmith tags list for a workflow run."""
-    tags = []
-
-    workflow_map = {
-        "technical_analysis": "workflow:technical_analysis",
-        "fundamental_analysis": "workflow:fundamental_analysis",
-        "podcast_generation": "workflow:podcast_generation",
-    }
-    tags.append(workflow_map.get(msg_type, "workflow:chat"))
-
+def get_langsmith_tags(locale: Optional[str] = None) -> List[str]:
+    """Build LangSmith tags list for a chat turn."""
+    tags = ["workflow:chat"]
     if locale:
         tags.append(f"locale:{locale}")
 

@@ -25,6 +25,15 @@ def _no_admitted_turn():
         yield by_key
 
 
+@pytest.fixture(autouse=True)
+def _no_live_hand_off():
+    with patch(
+        "src.server.database.runs.outbox.has_live_hand_off",
+        new=AsyncMock(return_value=False),
+    ) as live:
+        yield live
+
+
 def _job(n: int, hook_type: str = "task_report_back") -> dict:
     return {"hook_outbox_id": f"job-{n}", "hook_type": hook_type, "payload": {}}
 
@@ -51,7 +60,9 @@ async def _take(jobs, decisions, held, *, closed=(), hold=None, close=None):
         patch.object(steer, "_analyst_offer", new=AsyncMock(side_effect=decisions)),
         patch(_WAKE, new=wake),
     ):
-        reports = await steer.SteeredReportInbox().take("t-1", "run-A")
+        reports = await steer.SteeredReportInbox().take(
+            "t-1", "run-A", kinds=("report",)
+        )
     return reports, hold, close, wake
 
 
@@ -113,7 +124,7 @@ async def test_jobs_are_decided_concurrently():
         patch.object(steer, "_task_offer", new=_offer),
         patch(_WAKE, new=AsyncMock()),
     ):
-        reports = await steer.SteeredReportInbox().take("t-1", "run-A")
+        reports = await steer.SteeredReportInbox().take("t-1", "run-A", kinds=("report",))
 
     assert [r.job_id for r in reports] == ["job-1", "job-2"]
 
@@ -135,7 +146,7 @@ async def test_listing_failure_takes_nothing():
         f"{_OUTBOX}.list_steerable_report_jobs",
         new=AsyncMock(side_effect=RuntimeError("db down")),
     ):
-        assert await steer.SteeredReportInbox().take("t-1", "run-A") == []
+        assert await steer.SteeredReportInbox().take("t-1", "run-A", kinds=("report",)) == []
 
 
 @pytest.mark.asyncio
@@ -165,7 +176,7 @@ async def test_close_failure_keeps_the_reports_already_held():
     assert reports == [_report(1)]
 
 
-_OVERTAKING = "src.server.services.report_back.flash.executor.overtaking_run"
+_OVERTAKING = "src.server.services.report_back.handoff.executor.overtaking_run"
 
 
 def _held_analyst(n: int, run_id: str) -> dict:
@@ -222,12 +233,12 @@ async def test_a_held_report_whose_thread_cannot_be_read_again_is_given_back():
 @pytest.mark.asyncio
 async def test_confirm_closes_the_runs_held_reports_and_never_raises():
     confirm = AsyncMock(return_value=["job-1"])
-    with patch(f"{_OUTBOX}.confirm_steered_report_jobs", new=confirm):
+    with patch(f"{_OUTBOX}.confirm_jobs", new=confirm):
         await steer.SteeredReportInbox().confirm("run-A", ["job-1"])
-    confirm.assert_awaited_once_with(["job-1"], run_id="run-A")
+    confirm.assert_awaited_once_with(["job-1"], owner=("run", "run-A"))
 
     with patch(
-        f"{_OUTBOX}.confirm_steered_report_jobs",
+        f"{_OUTBOX}.confirm_jobs",
         new=AsyncMock(side_effect=RuntimeError("db down")),
     ):
         await steer.SteeredReportInbox().confirm("run-A", ["job-1"])
@@ -318,13 +329,13 @@ async def test_task_offer_steers_an_owed_report():
 # ---------------------------------------------------------------------------
 
 _CACHE = "src.utils.cache.redis_cache.get_cache_client"
-_DELIVERIES = "src.server.services.report_back.flash.requested_from.deliveries"
+_DELIVERIES = "src.server.services.report_back.handoff.requested_from.deliveries"
 
 
 def _analyst_cache(origin: dict, *, member: bool = True) -> MagicMock:
     cache = MagicMock()
     cache.get_strict = AsyncMock(
-        side_effect=lambda key: None if key.startswith("flash_rb_run:") else origin
+        side_effect=lambda key: None if key.startswith("handoff_rb_run:") else origin
     )
     cache.client.sismember = AsyncMock(return_value=member)
     return cache
@@ -341,9 +352,9 @@ def _analyst_job(**over) -> dict:
 
 def _origin(**over) -> dict:
     base = {
-        "origin": "flash",
+        "origin": "home",
         "report_back": True,
-        "flash_thread_id": "t-1",
+        "home_thread_id": "t-1",
         "user_id": "u-1",
     }
     base.update(over)
@@ -376,7 +387,7 @@ async def test_analyst_offer_leaves_automation_reports_to_the_executor():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("origin", "member"),
-    [(_origin(flash_thread_id="t-other"), True), (_origin(), False), (None, True)],
+    [(_origin(home_thread_id="t-other"), True), (_origin(), False), (None, True)],
     ids=["owed-to-another-thread", "pair-already-cleared", "origin-gone"],
 )
 async def test_analyst_offer_leaves_what_is_not_owed_here(origin, member):
@@ -400,13 +411,13 @@ async def test_analyst_offer_leaves_a_report_whose_summary_run_started(_no_admit
 
 @pytest.mark.asyncio
 async def test_analyst_offer_leaves_a_report_its_executor_is_posting():
-    from src.server.services.report_back.flash.executor import analyst_request_key
+    from src.server.services.report_back.handoff.executor import analyst_request_key
 
     cache = _analyst_cache(_origin())
     cache.get_strict = AsyncMock(
         side_effect=lambda key: (
             {"request_key": analyst_request_key("job-1")}
-            if key.startswith("flash_rb_run:")
+            if key.startswith("handoff_rb_run:")
             else _origin()
         )
     )
@@ -435,7 +446,7 @@ async def test_analyst_offer_carries_where_the_work_was_asked_for_inline():
     with (
         patch(_CACHE, return_value=_analyst_cache(_origin())),
         patch(
-            "src.server.services.report_back.flash.requested_from.reminder",
+            "src.server.services.report_back.handoff.requested_from.reminder",
             return_value="Asked in a Slack conversation.",
         ),
     ):

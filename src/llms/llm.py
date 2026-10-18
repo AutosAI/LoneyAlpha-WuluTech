@@ -293,7 +293,7 @@ class ModelConfig:
         Deliberately separate from the ``intelligence`` score, which is
         editorial copy for the model picker — a wording change there must not
         move agent behavior. Reads the raw entry (no ``visible`` gate) because
-        flash/compaction/fetch models are not all listed in the picker.
+        Background, compaction and fetch models are not all listed in the picker.
         """
         model_config = self.llm_config.get(model_name)
         if not model_config:
@@ -991,6 +991,16 @@ def create_llm(
     return instance.get_llm(cache_key=cache_key)
 
 
+def platform_key_configured(model_name: str) -> bool:
+    """Whether the deployment holds a key for a catalog model, the one
+    ``create_llm`` reads when no override is passed."""
+    try:
+        LLM(model_name)._resolve_api_key()
+    except MissingProviderKeyError:
+        return False
+    return True
+
+
 def create_llm_from_custom(
     config: dict,
     api_key: str | None = None,
@@ -1174,7 +1184,7 @@ def ensure_model_in_manifest(model_name: str) -> None:
     Shared guard: when a name reaches create_llm() but isn't in the manifest,
     the factory raises a generic "Model X not found" message that used to leak
     to users as an SSE error. Callers on the post-BYOK fallback path
-    (AgentConfig.get_llm_client, FlashAgent.__init__) call this helper instead,
+    (AgentConfig.get_llm_client, background_client) call this helper instead,
     so a missing manifest entry always surfaces as a user-friendly message
     pointing at Settings. ``resolve_llm_config`` already preflights the main
     model path via HTTPException — this is the belt-and-suspenders guard for

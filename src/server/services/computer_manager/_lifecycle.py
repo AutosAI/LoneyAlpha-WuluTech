@@ -33,6 +33,7 @@ from src.server.database.computer import (
     update_computer_activity,
     update_computer_status,
 )
+from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import (
     adopt_computer_sandbox_into_workspaces,
     computer_has_config_hash,
@@ -305,10 +306,10 @@ class SessionLifecycleMixin:
                     # every sibling project on the machine meanwhile.
                     pending_stop_wait = True
 
-                elif status == "flash":
+                elif is_unbound(workspace):
                     raise ValueError(
-                        f"Workspace {workspace_id} is a flash workspace (no sandbox). "
-                        "Use agent_mode='flash' instead, or create a new workspace for PTC mode."
+                        f"Workspace {workspace_id} is a Home on no computer "
+                        "yet; it reaches one only as Home."
                     )
 
                 else:
@@ -511,8 +512,9 @@ class SessionLifecycleMixin:
         # flight is left to finish and be re-read on the next request. An
         # errored sandbox is settled too: no stop will ever finish on it, and
         # the start's reconnect is what recovers it or rebuilds from the backup,
-        # so a row left 'stopping' would refuse that start forever.
-        if state in ("stopped", "archived", "error"):
+        # so a row left 'stopping' would refuse that start forever. An archive
+        # in progress only ends down, and one has been seen to run for days.
+        if state in ("stopped", "archived", "archiving", "error"):
             await self._settle_machine_stop(computer_id, ComputerStatus.STOPPED)
         elif state == "running":
             await self._settle_machine_stop(computer_id, ComputerStatus.RUNNING)

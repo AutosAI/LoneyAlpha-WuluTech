@@ -1,7 +1,7 @@
 """Which resolved servers earn an egress grant, and of which kind.
 
-One rule, read by the sandbox bind, the Flash bind and the config mutations
-that retire a grant before replying. A server that earns a grant on one path
+One rule, read by the sandbox bind and the config mutations that retire a
+grant before replying. A server that earns a grant on one path
 and not another is either a tool the model cannot call or an authorization
 overhang, so the rule is pinned here rather than at each caller.
 """
@@ -218,20 +218,6 @@ class TestOAuthKind:
         )
 
         assert [r.kind for r in refs] == [GRANT_KIND_OAUTH_MCP]
-
-    @pytest.mark.asyncio
-    async def test_the_flash_shape_drops_it(self):
-        # Flash has no sandbox, so a grant for a server it binds no tool of is
-        # authority nothing spends.
-        server = _server(connection_id="conn-1")
-        refs = await grant_refs(
-            _resolved(_entry(server, bound=False)),
-            user_id=USER,
-            direct_only=True,
-            snapshots=_snapshots(),
-        )
-
-        assert refs == []
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,12 @@
 checkpoint does not keep.
 
 Both ledgers carry it. A response row holds its main agent's reasoning
-durations (written by the finalize CAS) and, once backfilled, the facts its
-stored events resolve to under ``LEGACY_KEY``. A subagent run's row holds the
-captured URLs of the images its lane referenced (``images``) and the steering
-it handed back unread (``steering_returned``), both learned after its settle.
+durations (written by the finalize CAS) and, for a turn settled while its live
+stream was archived, what that archive added under ``LEGACY_KEY``, or, for one
+its checkpoints could not cover, the archive itself under ``ARCHIVE_KEY``
+(migration 069). A subagent run's row holds the captured URLs of the images
+its lane referenced (``images``) and the steering it handed back unread
+(``steering_returned``), written as each is learned.
 """
 
 from typing import Any, Dict, List, Optional
@@ -16,24 +18,42 @@ from src.server.database import pool
 from src.server.utils.pg_sanitize import SafeJson
 
 LEGACY_KEY = "legacy"
+ARCHIVE_KEY = "archive"
 
-# The version a row's legacy facts were resolved at, as text.
-LEGACY_VERSION_SQL = f"replay_facts #>> '{{{LEGACY_KEY},v}}'"
+
+def archived_stream(
+    response: Optional[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """The live stream a legacy turn's row kept whole (``ARCHIVE_KEY``), or
+    None for a row that kept none. A row keeps it only when its checkpoints
+    could not cover its turn, so it is the only record of what the turn
+    said. The rows are copies: replay stamps them in place."""
+    facts = (response or {}).get("replay_facts")
+    rows = facts.get(ARCHIVE_KEY) if isinstance(facts, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [
+        {"event": row["event"], "data": dict(row["data"])}
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("event")
+        and isinstance(row.get("data"), dict)
+    ]
 
 
 async def append_returned_steering(
-    task_run_id: str, returned: List[Dict[str, Any]]
+    task_run_id: str, returned: List[Dict[str, Any]], conn=None
 ) -> Optional[Dict[str, Any]]:
-    """Append steering a settled run handed back, returning its ``thread_id``
-    and ``parent_run_id`` (None when no row matched).
+    """Append steering a run handed back, returning its ``thread_id``,
+    ``parent_run_id`` and ``replay_facts`` (None when no row matched).
 
-    Not the settle CAS: the sweep that follows it reads the queue. The merge
-    is one statement, so an images write landing on the row at the same
-    time keeps its key.
+    ``conn`` is the transaction that settled the steers, so a return is
+    never recorded for a steer that stayed live. The merge is one statement,
+    so an images write landing on the row at the same time keeps its key.
     """
     if not returned:
         return None
-    async with pool.get_db_connection() as conn:
+    async with pool.get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -43,7 +63,7 @@ async def append_returned_steering(
                         COALESCE(replay_facts -> 'steering_returned', '[]'::jsonb)
                         || %(returned)s::jsonb)
                 WHERE task_run_id = %(id)s
-                RETURNING thread_id, parent_run_id
+                RETURNING thread_id, parent_run_id, replay_facts
                 """,
                 {"id": task_run_id, "returned": SafeJson(returned)},
             )

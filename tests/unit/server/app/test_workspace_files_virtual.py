@@ -20,7 +20,7 @@ from fastapi import HTTPException
 from ptc_agent.agent.backends.automations import AutomationsBackend
 from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.filesystem_routes import route_for
-from src.server.app.workspace_files import crud
+from src.server.app.workspace_files import _shared, crud
 from src.server.app.workspace_files._shared import (
     _present_virtual_file,
     _virtual_file,
@@ -129,6 +129,7 @@ async def test_a_reference_the_names_cannot_be_read_for_resolves_to_its_route(mo
 @pytest.fixture
 def workspace(monkeypatch):
     monkeypatch.setattr(crud, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
+    monkeypatch.setattr(_shared, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
     monkeypatch.setattr(crud, "owner_work_dir", lambda _ws: ROOT)
     monkeypatch.setattr(crud, "owner_layout", lambda _ws: SimpleNamespace(workspace=ROOT))
 
@@ -226,7 +227,9 @@ def held_elsewhere(monkeypatch):
     copy are never asked for one, running or stopped."""
 
     def _status(status: str) -> None:
-        monkeypatch.setattr(crud, "db_get_workspace", AsyncMock(return_value={**WORKSPACE, "status": status}))
+        read = AsyncMock(return_value={**WORKSPACE, "status": status})
+        monkeypatch.setattr(crud, "db_get_workspace", read)
+        monkeypatch.setattr(_shared, "db_get_workspace", read)
 
     @asynccontextmanager
     async def _acquire(*_):
@@ -323,3 +326,62 @@ async def test_the_panel_never_deletes_a_data_file(workspace, monkeypatch):
         "deleted": [],
         "errors": [{"path": path, "detail": route.undeletable} for path, route in CATALOG.items()],
     }
+
+
+SUBAGENT_FILES = [".agents/user/agents/main.md", ".agents/user/agents/data-prep.md"]
+
+
+def _sandbox_to_change(monkeypatch, probe) -> MagicMock:
+    sandbox = MagicMock()
+    sandbox.validate_path.return_value = True
+    sandbox.execute_bash_command = AsyncMock(return_value={"success": True})
+
+    @asynccontextmanager
+    async def _lock(_path):
+        yield
+
+    sandbox.path_write_lock = _lock
+
+    @asynccontextmanager
+    async def _acquire(*_):
+        yield sandbox, WORKSPACE
+
+    monkeypatch.setattr(crud, "_acquire_sandbox_to_change", _acquire)
+    monkeypatch.setattr(crud, "contained_sandbox_paths", probe)
+    return sandbox
+
+
+@pytest.mark.asyncio
+async def test_a_server_held_file_is_refused_as_such_when_the_mount_is_down(workspace, monkeypatch):
+    """With the file mount down the probe resolves its link to nothing."""
+    probe = AsyncMock(side_effect=lambda _sb, paths, work_dir: [None] * len(paths))
+    _sandbox_to_change(monkeypatch, probe)
+
+    result = await crud.delete_workspace_files(
+        workspace_id=WORKSPACE_ID, x_user_id=USER, body=crud.DeleteFilesRequest(paths=SUBAGENT_FILES)
+    )
+
+    assert result["deleted"] == []
+    assert [e["path"] for e in result["errors"]] == SUBAGENT_FILES
+    assert all(e["detail"] != "File not found" for e in result["errors"])
+    assert [e["detail"] for e in result["errors"]] == [_virtual_file(p).undeletable for p in SUBAGENT_FILES]
+
+
+@pytest.mark.asyncio
+async def test_a_server_held_file_is_not_probed_and_the_files_after_it_keep_their_slot(workspace, monkeypatch):
+    probe = AsyncMock(side_effect=lambda _sb, paths, work_dir: list(paths))
+    sandbox = _sandbox_to_change(monkeypatch, probe)
+
+    result = await crud.delete_workspace_files(
+        workspace_id=WORKSPACE_ID,
+        x_user_id=USER,
+        body=crud.DeleteFilesRequest(paths=[SUBAGENT_FILES[0], "notes.md", PORTFOLIO, "report.md"]),
+    )
+
+    assert probe.await_args.args[1] == [f"{ROOT}/notes.md", f"{ROOT}/report.md"]
+    assert result["deleted"] == ["notes.md", "report.md"]
+    assert result["errors"] == [
+        {"path": SUBAGENT_FILES[0], "detail": _virtual_file(SUBAGENT_FILES[0]).undeletable},
+        {"path": PORTFOLIO, "detail": UserDataBackend.undeletable},
+    ]
+    sandbox.execute_bash_command.assert_awaited_once_with(f"rm -f {ROOT}/notes.md {ROOT}/report.md")

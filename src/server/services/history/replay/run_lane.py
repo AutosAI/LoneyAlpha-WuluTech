@@ -25,9 +25,11 @@ from typing import Any
 
 from langchain_core.messages import ToolMessage
 
+from ptc_agent.agent.middleware.background_subagent.task import WORKFLOW_SUBAGENT_TYPE
 from ptc_agent.agent.transcript.classify import is_run_boundary_message
 from src.config.settings import get_redis_ttl_workflow_events
 from src.server.database.conversation import turn_slices as slices_db
+from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.database.runs import subagent_runs as sr_db
 from src.server.services.history import projector
 from src.server.services.history import slices
@@ -119,6 +121,11 @@ def _namespace_items(
 
 
 def _run_items(thread_id: str, run: SpanDelta, agent: str) -> list[dict[str, Any]]:
+    # Signals the run's messages do not carry (see ``context_signal_items``)
+    # open the run, ahead of its brief. The client hangs a notice on the
+    # lane's last assistant message: a previous run's, or in a task's first
+    # run none, which drops it. A stamped summary instead follows the run's
+    # earlier responses, where it fired.
     out = projector.context_signal_items(thread_id, run, agent=agent)
     out.extend(
         projector.with_model_fallbacks(
@@ -159,6 +166,11 @@ async def project_task_transcript(
     stream, and a checkpoint read here would hand the caller a partial
     transcript that never self-heals. An unresolvable status counts as
     running.
+
+    A workflow run has no transcript, only the driver's ui snapshot, so it
+    gets the lifecycle frames replay would project for its launch. A client
+    needs them while the launching turn is still running, which no history
+    load covers, once the run's stream has expired.
     """
     try:
         details = await resolve_task_details(thread_id, [task_id])
@@ -170,12 +182,32 @@ async def project_task_transcript(
             exc_info=True,
         )
         return []
-    if (details.get(task_id) or {}).get("status") not in TERMINAL_TASK_STATUSES:
+    detail = details.get(task_id) or {}
+    if detail.get("status") not in TERMINAL_TASK_STATUSES:
         return []
 
     reader = CheckpointHistoryReader.get_instance()
     history = await reader.aget_task_history(thread_id, task_id)
+    if await _is_workflow_run(thread_id, task_id, history):
+        return projector.workflow_run_items(
+            history,
+            task_id=task_id,
+            ledger_status=detail["status"],
+            ledger_failure=detail.get("error"),
+        )
     return _run_items(thread_id, history, f"task:{task_id}")
+
+
+async def _is_workflow_run(thread_id: str, task_id: str, history: SpanDelta) -> bool:
+    """The driver's ui snapshot answers without a read; the task row only for
+    a driver that died before its first one. An unreadable row raises, since
+    the transcript path would hand the client an empty panel for good."""
+    if any(
+        r.get("name") == projector.WORKFLOW_RUN_UI_NAME for r in history.new_ui_records
+    ):
+        return True
+    task = await sr_db.get_task(thread_id, task_id)
+    return task is not None and task.get("subagent_type") == WORKFLOW_SUBAGENT_TYPE
 
 
 async def _gather_bounded(coros: list[Any]) -> list[Any]:
@@ -247,14 +279,9 @@ class RunLane:
         reader: CheckpointHistoryReader,
         thread_id: str,
         run_facts: replay_facts.RunFacts,
-        *,
-        cache: bool = True,
     ):
         self._reader = reader
         self._thread_id = thread_id
-        # Without it no stored run slice is read: every run is cut from its
-        # checkpoints.
-        self._cache = cache
         # The read's snapshot: the same rows the turns' lines keys covered.
         self._facts = run_facts
         self._serde = reader.serde
@@ -434,7 +461,7 @@ class RunLane:
 
     async def _load_stored(self, task_ids: set[str]) -> None:
         task_ids = task_ids - self._loaded_tasks
-        if not task_ids or not self._cache:
+        if not task_ids:
             return
         self._loaded_tasks |= task_ids
         for row in await slices_db.get_run_slices(self._thread_id, sorted(task_ids)):
@@ -520,13 +547,15 @@ class RunLane:
                 self._runs[(task_id, run.input_checkpoint_id)] = _RunSlice(run_slice)
 
     def _unavailable(self, task_id: str, error: BaseException) -> None:
+        if isinstance(error, DATABASE_UNAVAILABLE):
+            raise error
         logger.warning(
             "[REPLAY] Failed to read subagent checkpoint state task:%s",
             task_id,
             exc_info=(type(error), error, error.__traceback__),
         )
         # Silent continuation would produce a plausible-looking but
-        # incomplete transcript and bypass the endpoint's SSE fallback.
+        # incomplete transcript instead of the turn's stub.
         raise CheckpointReplayUnavailable(
             f"subagent checkpoint state unavailable for task:{task_id}"
         ) from error

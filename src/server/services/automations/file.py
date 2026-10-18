@@ -48,6 +48,8 @@ from ptc_agent.agent.backends.db_json_route import (
 from ptc_agent.core.paths import AUTOMATION_FILE_NAME
 from ptc_agent.core.sandbox.livefs_mount import CallContext
 from src.server.database import automation as auto_db
+from src.server.database.home_workspace import get_home_workspace_id, is_home_id
+from src.server.database.user_lock import lock_user_writes
 from src.server.models.automation import (
     SCHEDULE_FIELD,
     AutomationCreate,
@@ -65,6 +67,7 @@ from src.server.models.automation import (
 from src.server.services.automations import lifecycle
 from src.server.services.llm import user_models
 from src.server.services.price_monitor import watched_market
+from src.server.utils.pg_sanitize import normalize_uuid
 from src.utils.timezone_utils import zone_or_none
 
 logger = logging.getLogger(__name__)
@@ -88,7 +91,6 @@ _EDITABLE = (
     "trigger_config",
     "timezone",
     "instruction",
-    "agent_mode",
     "workspace_id",
     "thread",
     "llm_model",
@@ -151,6 +153,11 @@ def _thread_value(row: dict[str, Any]) -> str:
     return "persistent" if in_own_thread(row) else str(row["conversation_thread_id"])
 
 
+# How a file names the user's Home in workspace_id, both ways: an analyst in
+# a workspace never sees Home's id.
+_HOME = "home"
+
+
 def _definition(row: dict[str, Any]) -> dict[str, Any]:
     """The editable part of a row, as the file shows it."""
     kind = row["trigger_type"]
@@ -167,12 +174,11 @@ def _definition(row: dict[str, Any]) -> dict[str, Any]:
         entry["next_run_at"] = _iso(row.get("next_run_at"), tz)
     else:
         entry["trigger_config"] = row.get("trigger_config") or {}
-    workspace_id = row.get("workspace_id")
+    stored = normalize_uuid(row.get("workspace_id"))
     entry.update(
         timezone=tz,
         instruction=row["instruction"],
-        agent_mode=row["agent_mode"],
-        workspace_id=str(workspace_id) if workspace_id else None,
+        workspace_id=_HOME if is_home_id(row["user_id"], stored) else stored,
         thread=_thread_value(row),
         llm_model=row.get("llm_model"),
         delivery=[
@@ -268,7 +274,7 @@ class _Entry(BaseModel):
     trigger_config: dict[str, Any] | None = None
     timezone: str | None = None
     instruction: str | None = None
-    agent_mode: Literal["ptc", "flash"] | None = None
+    # "home" is read as Home's id, from the validation context.
     workspace_id: UUID | None = None
     thread: dict[str, Any] | None = None
     llm_model: str | None = None
@@ -278,10 +284,16 @@ class _Entry(BaseModel):
 
     # Fields every automation has: null is refused rather than read as
     # "clear". A schedule field's null depends on the kind, so the plan reads it.
-    @field_validator("name", "status", "trigger_type", "timezone", "instruction", "agent_mode", "max_failures", mode="before")
+    @field_validator("name", "status", "trigger_type", "timezone", "instruction", "max_failures", mode="before")
     @classmethod
     def _required_value(cls, value: Any) -> Any:
         return _not_null(value)
+
+    @field_validator("workspace_id", mode="before")
+    @classmethod
+    def _home(cls, value: Any, info: ValidationInfo) -> Any:
+        # Only the exact keyword: any other string meets the UUID's own refusal.
+        return (info.context or {})["home"] if value == _HOME else value
 
     @field_validator("timezone")
     @classmethod
@@ -473,6 +485,8 @@ class Document:
     # What the lifecycle checks a named model against; None when the file
     # names no model it would check.
     model_pref: dict[str, Any] | None
+    # The user's Home's id, which a written "home" names.
+    home_id: str
     # The delivery with each chat it newly names as the messaging service
     # files it; None when it names none to check. ``delivery_problems`` are
     # the chats it refused.
@@ -505,14 +519,13 @@ def _plan_create(entry: _Entry, call: CallContext, zone: str, problems: _Problem
         return None
 
     # The defaults of the old automation tool, so an automation made through
-    # a file matches one it made: this workspace, the user's clock, a PTC run.
+    # a file matches one it made: this workspace, the user's clock.
     tz = entry.timezone or zone
     data: dict[str, Any] = {
         "trigger_type": kind,
         "timezone": tz,
-        "agent_mode": entry.agent_mode or "ptc",
-        "workspace_id": entry.workspace_id if "workspace_id" in written else call.workspace_id,
         **(entry.thread or {}),
+        "workspace_id": entry.workspace_id if "workspace_id" in written else call.workspace_id,
     }
     for key in ("name", "description", "instruction", "llm_model", "max_failures"):
         if key in written:
@@ -544,7 +557,9 @@ def _plan_create(entry: _Entry, call: CallContext, zone: str, problems: _Problem
 def _plan_update(entry: _Entry, raw: dict[str, Any], row: dict[str, Any], problems: _Problems) -> _Update | None:
     """The fields that differ from the row, and the pause or resume a status
     asks for; what the row allows beyond that is the lifecycle's to say."""
-    current = _definition(row)
+    # The file shows Home as "home", which the entry already read as Home's
+    # id, so a workspace is compared with the id the row stores.
+    current = {**_definition(row), "workspace_id": normalize_uuid(row.get("workspace_id"))}
     kind = row["trigger_type"]
     tz = entry.timezone or current["timezone"]
     fields: dict[str, Any] = {}
@@ -611,7 +626,7 @@ def _plan_update(entry: _Entry, raw: dict[str, Any], row: dict[str, Any], proble
             problems.add(key, f"this automation {_RAN_ONCE}")
             continue
         if key == "workspace_id" and value is None:
-            problems.add(key, "can't be cleared; point it at another workspace instead")
+            problems.add(key, "can't be cleared; point it at another workspace, or \"home\" for the user's Home, instead")
             continue
         fields[key] = value
         changed.append(key)
@@ -730,6 +745,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             shown=shown,
             timezone=zone,
             model_pref=await user_models.get_model_preference(user_id) if _names_model(written, shown) else None,
+            home_id=get_home_workspace_id(user_id),
             delivery=delivery,
             delivery_problems=refused,
         )
@@ -771,7 +787,12 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             problems.add("delivery", refused)
         try:
             entry = _Entry.model_validate(
-                raw, context={"thread_id": call.thread_id, "zone": row.get("timezone") if row else None}
+                raw,
+                context={
+                    "thread_id": call.thread_id,
+                    "zone": row.get("timezone") if row else None,
+                    "home": document.home_id,
+                },
             )
         except ValidationError as exc:
             problems.add_validation(exc)
@@ -806,9 +827,17 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         stands locked, which the caller holds to the version it checked,
         since an edit on the Automations page may have landed after its
         read. None for a create, which the user's lock and the unique file
-        name keep apart, and for a save with no changes."""
+        name keep apart, and for a save with no changes.
+
+        An update may make the user's Home (``lifecycle.update_automation``),
+        which takes the user's write lock. A fold of a former Home takes that
+        lock before the automation rows it moves, so it is taken first here
+        too, or the two wait on each other."""
         if not (plan.update or plan.delete):
             return None
+        if plan.update and plan.update.fields:
+            async with conn.cursor() as cur:
+                await lock_user_writes(cur, user_id)
         locked = await auto_db.get_automation_file(user_id, self.file_name, conn=conn, lock=True)
         return _version(locked) if locked else ""
 
@@ -882,7 +911,18 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 control = lifecycle.pause_automation if update.action == "pause" else lifecycle.resume_automation
                 row = await step(control, update.automation_id, user_id, current=row)
             if row is not _REFUSED:
-                parts = [", ".join(update.changed)] if update.changed else []
+                changed = update.changed
+                if (
+                    "thread" not in changed
+                    and update.row.get("conversation_thread_id")
+                    and not row.get("conversation_thread_id")
+                    and _thread_value(row) != _thread_value(update.row)
+                ):
+                    # A move that named no thread unpinned the conversation
+                    # it continued. Read only once unpinned: the row an
+                    # update returns doesn't say whether it owns its thread.
+                    changed = [*changed, "thread"]
+                parts = [", ".join(changed)] if changed else []
                 if update.action:
                     parts.append("paused" if update.action == "pause" else "resumed")
                 report = f'Saved {self.file_name}: updated "{update.name}": {"; ".join(parts)}{_next_run(row)}'
@@ -912,7 +952,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             lines.append(f"Note: {warning}")
         return "\n".join([*lines, *plan.notes])
 
-    async def rename(self, user_id: str, to: str, conn: Any) -> str | None:
+    async def rename(self, user_id: str, to: str, conn: Any, call: CallContext) -> str | None:
         # The row is locked, since a delete on the Automations page takes no
         # user lock: a rename that lost to one moved nothing.
         row = await auto_db.get_automation_file(user_id, self.file_name, conn=conn, lock=True)

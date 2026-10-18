@@ -129,8 +129,8 @@ export interface Automation {
   next_run_at: string | null;
   last_run_at: string | null;
 
-  agent_mode: 'flash' | 'ptc';
   instruction: string;
+  /** Where it runs: Home's id for All workspaces, else that workspace's. */
   workspace_id: string | null;
   llm_model: string | null;
 
@@ -160,9 +160,9 @@ export interface AutomationPayload {
   timezone: string;
   trigger_config?: PriceTriggerConfig;
   next_run_at?: string;
-  agent_mode: Automation['agent_mode'];
   instruction: string;
-  workspace_id?: string;
+  /** Home's id for All workspaces, else the workspace's. */
+  workspace_id: string;
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
   delivery_config: DeliveryConfig;
@@ -177,7 +177,6 @@ export type AutomationUpdatePayload = Partial<Omit<AutomationPayload, 'trigger_t
  *  the automation it belongs to. */
 export interface AutomationRun extends AutomationExecution {
   automation_name: string;
-  agent_mode: Automation['agent_mode'];
   trigger_type: TriggerType;
   workspace_id: string | null;
 }

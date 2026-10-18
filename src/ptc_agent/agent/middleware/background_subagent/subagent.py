@@ -1,7 +1,7 @@
 """Middleware for providing subagents to an agent via a `Task` tool."""
 
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Annotated, Any, NotRequired, TypedDict, cast
 
@@ -23,6 +23,10 @@ from langgraph.config import get_config
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
+from ptc_agent.agent.middleware.background_subagent.context import (
+    steer_resume_for,
+    steer_resume_held,
+)
 from ptc_agent.agent.middleware.background_subagent.middleware import (
     current_background_token_tracker,
     current_background_tool_call_id,
@@ -380,8 +384,13 @@ async def arun_subagent_streaming(
     )
     try:
         with _detached_from_launcher():
+            # Sync, as the main graph runs: a model call confirms the steers
+            # the step before it injected, so that step must be saved first.
             stream = subagent.astream(
-                state, config, stream_mode=["values", "messages", "custom"]
+                state,
+                config,
+                stream_mode=["values", "messages", "custom"],
+                durability="sync",
             )
             try:
                 async for mode, data in stream:
@@ -488,6 +497,28 @@ async def arun_subagent_streaming(
     return last_state if last_state is not None else {}
 
 
+def _unknown_type_refusal(
+    effective_type: str, roster: Iterable[str], *, resuming: bool
+) -> str:
+    """Why a Task names a subagent this build did not compile.
+
+    A resumed task outlives the roster it started on: its subagent may have
+    been deleted, renamed or turned off since, or serve only the other role,
+    and saying so tells the model not to retry under the same name.
+    """
+    allowed_types = ", ".join([f"`{k}`" for k in roster])
+    if resuming:
+        return (
+            f"Cannot resume: subagent `{effective_type}` was deleted, renamed, "
+            f"turned off, or isn't available to this agent. "
+            f"Available types: {allowed_types}"
+        )
+    return (
+        f"We cannot invoke subagent {effective_type} because it does not exist, "
+        f"the only allowed types are {allowed_types}"
+    )
+
+
 def _launch_refusal(reason: str, runtime: Any) -> "str | ToolMessage":
     """A Task refusal the frontend can settle on.
 
@@ -502,6 +533,23 @@ def _launch_refusal(reason: str, runtime: Any) -> "str | ToolMessage":
     return ToolMessage(
         content=reason, tool_call_id=tool_call_id, name="Task", status="error"
     )
+
+
+def _run_opener(prompt: str, task_id: str) -> HumanMessage:
+    """The message a resumed run of ``task_id`` opens with. A resume for
+    messages the last run never read carries them as delivered steers, for
+    replay to show as its live stream did, and the rows the resume handed
+    this run, which its first model call confirms (``SubagentSteeringMiddleware``)
+    once this message is checkpointed. Not marked as steering, so it still
+    opens a run."""
+    kwargs: dict[str, Any] = {}
+    delivered = steer_resume_for(task_id)
+    if delivered:
+        kwargs["steering_delivered"] = delivered
+    held = steer_resume_held(task_id)
+    if held:
+        kwargs["held_jobs"] = held
+    return HumanMessage(content=prompt, additional_kwargs=kwargs)
 
 
 def return_command_with_state_update(result: dict, tool_call_id: str) -> Command:
@@ -634,9 +682,10 @@ def _create_task_tool(
             _bg_checkpoint_ns, resume_type = _get_background_task_context()
             effective_type = effective_type or resume_type or "general-purpose"
             if effective_type not in subagent_graphs:
-                allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
                 return _launch_refusal(
-                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    _unknown_type_refusal(
+                        effective_type, subagent_graphs, resuming=action == "resume"
+                    ),
                     runtime,
                 )
         else:
@@ -646,9 +695,8 @@ def _create_task_tool(
                     "Error: subagent_type is required for new tasks.", runtime
                 )
             if effective_type not in subagent_graphs:
-                allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
                 return _launch_refusal(
-                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    _unknown_type_refusal(effective_type, subagent_graphs, resuming=False),
                     runtime,
                 )
 
@@ -733,9 +781,10 @@ def _create_task_tool(
             # For resume/follow-up, type is inferred; validate if explicitly provided
             effective_type = effective_type or resume_type or "general-purpose"
             if effective_type not in subagent_graphs:
-                allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
                 return _launch_refusal(
-                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    _unknown_type_refusal(
+                        effective_type, subagent_graphs, resuming=action == "resume"
+                    ),
                     runtime,
                 )
         else:
@@ -745,9 +794,8 @@ def _create_task_tool(
                     "Error: subagent_type is required for new tasks.", runtime
                 )
             if effective_type not in subagent_graphs:
-                allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
                 return _launch_refusal(
-                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    _unknown_type_refusal(effective_type, subagent_graphs, resuming=False),
                     runtime,
                 )
 
@@ -774,7 +822,9 @@ def _create_task_tool(
             invoke_state = {
                 k: v for k, v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS
             }
-            invoke_state["messages"] = [HumanMessage(content=prompt)]
+            invoke_state["messages"] = [
+                _run_opener(prompt, bg_checkpoint_ns.removeprefix("task:"))
+            ]
             config = {
                 **parent_config,
                 "configurable": {

@@ -213,7 +213,7 @@ class TestClassifyNonRecoverableErrorType:
         assert result == "workflow_error"
 
     def test_unrelated_value_error_defaults_to_workflow_error(self):
-        result = self._classify(ValueError("invalid agent_mode"))
+        result = self._classify(ValueError("invalid reasoning_effort"))
         assert result == "workflow_error"
 
 
@@ -297,8 +297,6 @@ class TestHandleWorkflowErrorHTTPException:
                     start_time=0.0,
                     request=self._request(),
                     is_byok=False,
-                    msg_type="ptc",
-                    log_prefix="PTC_TEST",
                 )
             ]
 
@@ -348,8 +346,6 @@ class TestHandleWorkflowErrorHTTPException:
                     start_time=0.0,
                     request=self._request(),
                     is_byok=False,
-                    msg_type="ptc",
-                    log_prefix="PTC_TEST",
                 )
             ]
 
@@ -397,8 +393,6 @@ class TestHandleWorkflowErrorHTTPException:
                     start_time=0.0,
                     request=self._request(),
                     is_byok=False,
-                    msg_type="ptc",
-                    log_prefix="PTC_TEST",
                 )
             ]
 
@@ -448,8 +442,6 @@ class TestHandleWorkflowErrorHTTPException:
                     start_time=0.0,
                     request=self._request(),
                     is_byok=False,
-                    msg_type="ptc",
-                    log_prefix="PTC_TEST",
                 )
             ]
 

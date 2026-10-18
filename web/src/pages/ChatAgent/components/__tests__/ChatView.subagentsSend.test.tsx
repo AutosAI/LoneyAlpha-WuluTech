@@ -1,19 +1,19 @@
 /**
  * A send carries the subagents setting only when it creates the thread: on a
  * live thread the PATCH a flip makes is the only writer, so a send never
- * re-sends a cached value over a newer flip from another tab. A flash thread
- * has no such setting. A landing composer's toggle arrives in the navigation
- * state, rides the first send and is what the new thread's toggle shows. What
- * the toggle holds when the new thread's id arrives is saved on its row, so a
- * flip made while the send was creating it is not lost. A new chat's view is
- * cached while unsent and taken up by the next navigation to one, whose pick
- * replaces whatever the view held.
+ * re-sends a cached value over a newer flip from another tab. Home's threads
+ * hold it like any workspace's. A landing composer's toggle arrives in the
+ * navigation state, rides the first send and is what the new thread's toggle
+ * shows. What the toggle holds when the new thread's id arrives is saved on
+ * its row, so a flip made while the send was creating it is not lost. A new
+ * chat's view is cached while unsent and taken up by the next navigation to
+ * one, whose pick replaces whatever the view held.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import '@testing-library/jest-dom';
 import type React from 'react';
 import { act, render, waitFor } from '@testing-library/react';
-import { MemoryRouter, useNavigate, type NavigateFunction } from 'react-router';
+import { MemoryRouter, useLocation, useNavigate, type NavigateFunction } from 'react-router';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { createTestQueryClient } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   getThread: vi.fn(),
   getWorkspace: vi.fn(),
   updateThread: vi.fn(),
+  setValue: vi.fn(),
 }));
 
 vi.mock('@/lib/framer', async () => (await import('./chatViewHarness')).framerMock());
@@ -34,7 +35,17 @@ vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'light', setTheme: () => {} }),
 }));
 vi.mock('../Markdown', async () => (await import('./chatViewHarness')).markdownMock());
-vi.mock('../../../../components/ui/chat-input', async () => (await import('./chatViewHarness')).chatInputMock());
+// The harness's composer, with the one handle method a draft is seeded through.
+vi.mock('../../../../components/ui/chat-input', async () => {
+  const { useImperativeHandle } = await import('react');
+  const { default: Stub } = (await import('./chatViewHarness')).chatInputMock();
+  return {
+    default: function ChatInputStub(props: Record<string, unknown>) {
+      useImperativeHandle(props.ref as React.Ref<unknown>, () => ({ setValue: mocks.setValue }));
+      return Stub(props);
+    },
+  };
+});
 vi.mock('../../hooks/useChatMessages', async (importOriginal) =>
   (await import('./chatViewHarness')).chatMessagesMock(await importOriginal()));
 vi.mock('../../hooks/useWorkspaceFiles', async () => (await import('./chatViewHarness')).workspaceFilesMock());
@@ -73,10 +84,11 @@ beforeEach(() => {
   mocks.getThread.mockReset();
   mocks.getWorkspace.mockReset();
   mocks.updateThread.mockReset();
+  mocks.setValue.mockReset();
 });
 
 describe('ChatView: the subagents setting on a send', () => {
-  it("is left off a PTC send on a live thread, whose row holds it", async () => {
+  it("is left off a send on a live thread, whose row holds it", async () => {
     mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Harness WS', status: 'active' });
     mocks.getThread.mockResolvedValue({ thread_id: THREAD_ID, subagents_allowed: false });
     mountChatView(ChatView);
@@ -100,13 +112,12 @@ describe('ChatView: the subagents setting on a send', () => {
     expect(mocks.updateThread).toHaveBeenCalledWith(THREAD_ID, { subagents_allowed: false });
   });
 
-  it('is left off a flash send, which has no such setting', async () => {
-    mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Harness WS', status: 'flash' });
+  it("shows Home's toggle from its thread row and leaves it off a send", async () => {
+    mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Home', status: 'running', is_home: true });
     mocks.getThread.mockResolvedValue({ thread_id: THREAD_ID, subagents_allowed: false });
     mountChatView(ChatView);
 
-    await waitFor(() => expect(chatInput.props?.mode).toBe('fast'));
-    await waitFor(() => expect(mocks.getThread).toHaveBeenCalled());
+    await waitFor(() => expect(chatInput.props?.subagentsAllowed).toBe(false));
     const options = send({ model: 'm1' });
     expect(options).toMatchObject({ model: 'm1' });
     expect(options.subagentsAllowed).toBeUndefined();
@@ -243,5 +254,35 @@ describe('ChatView: a new chat view taken up by a later landing send', () => {
     await waitFor(() => expect(chatState.handleSendMessage).toHaveBeenCalledTimes(1));
     expect((chatState.handleSendMessage.mock.calls[0][3] as Record<string, unknown>).subagentsAllowed).toBeUndefined();
     expect(chatInput.props?.subagentsAllowed).toBe(true);
+  });
+});
+
+describe("ChatView: a draft from Subagents' Create with the agent", () => {
+  it('lands in the composer unsent, once, and leaves the navigation state', async () => {
+    mocks.getWorkspace.mockResolvedValue({ workspace_id: WORKSPACE_ID, name: 'Home', status: 'running', is_home: true });
+    chatState.threadId = '__default__';
+    let state = null as Record<string, unknown> | null;
+    const Probe = () => {
+      state = useLocation().state as Record<string, unknown> | null;
+      return null;
+    };
+    const entry = {
+      pathname: '/chat/t/__default__',
+      state: { workspaceId: WORKSPACE_ID, draftMessage: 'Set up a subagent that ' },
+    };
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <MemoryRouter initialEntries={[entry]}>
+          <Probe />
+          <ChatView workspaceId={WORKSPACE_ID} threadId="__default__" onBack={vi.fn()} workspaceName="Harness WS" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(state?.draftMessage).toBeUndefined());
+    expect(state?.workspaceId).toBe(WORKSPACE_ID);
+    expect(mocks.setValue).toHaveBeenCalledTimes(1);
+    expect(mocks.setValue).toHaveBeenCalledWith('Set up a subagent that ');
+    expect(chatState.handleSendMessage).not.toHaveBeenCalled();
   });
 });

@@ -85,17 +85,21 @@ export type ResourceTier = 'standard' | 'performance' | 'max';
 export interface Workspace {
   workspace_id: string;
   name: string;
+  /** Lifecycle of the workspace's computer. Home reads `'unbound'` until its
+   *  first start or turn puts it on one. */
   status?: string;
+  /** The user's Home, where All workspaces runs. Never read Home off `status`. */
+  is_home: boolean;
   description?: string;
   config?: Record<string, unknown>;
-  /** Sandbox resource tier. Absent on flash / legacy rows. */
+  /** Sandbox resource tier. Absent on Home and legacy rows. */
   resource_tier?: ResourceTier;
-  /** Keep the sandbox running (idle auto-stop disabled). Absent on flash / legacy rows. */
+  /** Keep the sandbox running (idle auto-stop disabled). Absent on Home and legacy rows. */
   is_always_on?: boolean;
   /**
-   * The machine this workspace lives on. Absent on flash workspaces and on rows
-   * that predate the split, which is exactly when the per-workspace status
-   * channel stays the only source for this row's state.
+   * The machine this workspace lives on. Absent on Home before its first start
+   * and on rows that predate the split, which is exactly when the
+   * per-workspace status channel stays the only source for this row's state.
    */
   computer_id?: string | null;
   /** Folder name under the computer's root: the workspace's address on disk. */
@@ -281,7 +285,7 @@ export interface ReorderItem {
 // --- Thread ---
 
 /** An agent that hands turns to a workspace's thread. */
-export type DispatchingAgent = 'chief_of_staff' | 'flash';
+export type DispatchingAgent = 'chief_of_staff';
 
 /**
  * Who initiated a thread, or one turn of it (a query row's metadata carries
@@ -394,6 +398,8 @@ export type ShareLinkKind = 'file' | 'app';
 
 interface ShareLinkBase {
   code: string;
+  /** The workspace the item lives in. */
+  workspace_id: string;
   /** App-relative, `/a/<code>`. */
   url: string;
   title: string | null;
@@ -613,7 +619,6 @@ export interface SSEEventData {
 export interface ChatMessageBody {
   workspace_id: string;
   messages: Array<{ role: string; content: string }>;
-  agent_mode: string;
   locale: string;
   timezone: string;
   additional_context?: unknown;

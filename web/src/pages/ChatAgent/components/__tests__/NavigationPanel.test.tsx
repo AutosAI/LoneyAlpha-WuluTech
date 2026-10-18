@@ -60,7 +60,7 @@ interface RenderOpts {
 function renderPanel({ agents }: RenderOpts) {
   return render(
     <NavigationPanel
-      workspaces={[{ workspace_id: WS_ID, name: 'Test workspace' }]}
+      workspaces={[{ workspace_id: WS_ID, name: 'Test workspace', is_home: false }]}
       workspaceThreads={{
         [WS_ID]: {
           threads: [{ thread_id: THREAD_ID, title: 'Test thread' }],
@@ -239,9 +239,9 @@ describe('NavigationPanel — workspace render order', () => {
     render(
       <NavigationPanel
         workspaces={[
-          { workspace_id: 'ws-a', name: 'Workspace A' },
-          { workspace_id: 'ws-b', name: 'Workspace B' },
-          { workspace_id: 'ws-c', name: 'Workspace C' },
+          { workspace_id: 'ws-a', name: 'Workspace A', is_home: false },
+          { workspace_id: 'ws-b', name: 'Workspace B', is_home: false },
+          { workspace_id: 'ws-c', name: 'Workspace C', is_home: false },
         ]}
         workspaceThreads={{}}
         currentWorkspaceId="ws-c"
@@ -265,7 +265,7 @@ describe('NavigationPanel — show more threads', () => {
     resetNavPanelExpansion();
     render(
       <NavigationPanel
-        workspaces={[{ workspace_id: WS_ID, name: 'Test workspace' }]}
+        workspaces={[{ workspace_id: WS_ID, name: 'Test workspace', is_home: false }]}
         workspaceThreads={{ [WS_ID]: threadsData }}
         currentWorkspaceId={WS_ID}
         currentThreadId={null}
@@ -317,7 +317,7 @@ describe('NavigationPanel — active-thread auto-reveal', () => {
   function renderWithActiveThread(opts: {
     threadsData: { threads: { thread_id: string; title: string }[]; loading: boolean; total?: number };
     currentThreadId: string | null;
-    status?: string;
+    isHome?: boolean;
     isActive?: boolean;
     onLoadMoreThreads?: Mock<(wsId: string) => void>;
   }) {
@@ -326,7 +326,7 @@ describe('NavigationPanel — active-thread auto-reveal', () => {
     render(
       <NavigationPanel
         isActive={opts.isActive ?? true}
-        workspaces={[{ workspace_id: WS_ID, name: 'Test workspace', status: opts.status }]}
+        workspaces={[{ workspace_id: WS_ID, name: 'Test workspace', is_home: opts.isHome ?? false }]}
         workspaceThreads={{ [WS_ID]: opts.threadsData }}
         currentWorkspaceId={WS_ID}
         currentThreadId={opts.currentThreadId}
@@ -409,7 +409,7 @@ describe('NavigationPanel — active-thread auto-reveal', () => {
     expect(onLoadMoreThreads).not.toHaveBeenCalled();
   });
 
-  it('auto-reveals in the flash workspace (pages like any other workspace)', async () => {
+  it('auto-reveals in Home (pages like any other workspace)', async () => {
     const onLoadMoreThreads = renderWithActiveThread({
       threadsData: {
         threads: [{ thread_id: 't-1', title: 'Thread one' }],
@@ -417,7 +417,7 @@ describe('NavigationPanel — active-thread auto-reveal', () => {
         total: 14,
       },
       currentThreadId: 't-9',
-      status: 'flash',
+      isHome: true,
     });
 
     await waitFor(() => expect(onLoadMoreThreads).toHaveBeenCalled());
@@ -442,8 +442,8 @@ describe('NavigationPanel — workspace drag-reorder affordances', () => {
     return render(
       <NavigationPanel
         workspaces={[
-          { workspace_id: 'ws-flash', name: 'Flash workspace', status: 'flash' },
-          { workspace_id: 'ws-a', name: 'Workspace A' },
+          { workspace_id: 'ws-home', name: 'Home', status: 'running', is_home: true },
+          { workspace_id: 'ws-a', name: 'Workspace A', is_home: false },
         ]}
         workspaceThreads={{}}
         currentWorkspaceId="ws-a"
@@ -459,13 +459,14 @@ describe('NavigationPanel — workspace drag-reorder affordances', () => {
     );
   }
 
-  it('marks workspace header rows sortable, including the flash workspace', () => {
+  it('marks workspace header rows sortable, including Home', () => {
     renderReorderPanel(vi.fn());
 
     const sortable = screen.getByText('Workspace A').closest('[aria-roledescription="sortable"]');
     expect(sortable).not.toBeNull();
-    // Flash drags too — the pin-boundary guard keeps it inside the pinned block.
-    expect(screen.getByText('Flash workspace').closest('[aria-roledescription="sortable"]')).not.toBeNull();
+    // Home drags too; the pin-boundary guard keeps it inside the pinned
+    // block. It shows as All workspaces, not its stored name.
+    expect(screen.getByText('agents.allWorkspaces').closest('[aria-roledescription="sortable"]')).not.toBeNull();
   });
 
   it('renders plain rows when no reorder handler is provided', () => {
@@ -480,8 +481,8 @@ describe('NavigationPanel — expansion survives remounts', () => {
     return render(
       <NavigationPanel
         workspaces={[
-          { workspace_id: 'ws-a', name: 'Workspace A' },
-          { workspace_id: 'ws-b', name: 'Workspace B' },
+          { workspace_id: 'ws-a', name: 'Workspace A', is_home: false },
+          { workspace_id: 'ws-b', name: 'Workspace B', is_home: false },
         ]}
         workspaceThreads={{
           'ws-a': { threads: [{ thread_id: 'ta-1', title: 'Thread A1' }], loading: false },
@@ -568,8 +569,8 @@ describe('NavigationPanel — shared expansion across instances', () => {
     return render(
       <NavigationPanel
         workspaces={[
-          { workspace_id: 'ws-a', name: 'Workspace A' },
-          { workspace_id: 'ws-b', name: 'Workspace B' },
+          { workspace_id: 'ws-a', name: 'Workspace A', is_home: false },
+          { workspace_id: 'ws-b', name: 'Workspace B', is_home: false },
         ]}
         workspaceThreads={{
           'ws-a': { threads: [{ thread_id: 'ta-1', title: 'Thread A1' }], loading: false },
@@ -619,9 +620,9 @@ describe('NavigationPanel — shared expansion across instances', () => {
     return render(
       <NavigationPanel
         workspaces={[
-          { workspace_id: 'ws-a', name: 'Workspace A' },
-          { workspace_id: 'ws-b', name: 'Workspace B' },
-          { workspace_id: 'ws-c', name: 'Workspace C' },
+          { workspace_id: 'ws-a', name: 'Workspace A', is_home: false },
+          { workspace_id: 'ws-b', name: 'Workspace B', is_home: false },
+          { workspace_id: 'ws-c', name: 'Workspace C', is_home: false },
         ]}
         workspaceThreads={{
           'ws-a': { threads: [{ thread_id: 'ta-1', title: 'Thread A1' }], loading: false },

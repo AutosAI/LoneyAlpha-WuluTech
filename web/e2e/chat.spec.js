@@ -93,10 +93,10 @@ test.describe('Workspace Gallery', () => {
   });
 
   test('empty state shows create prompt', async ({ page }) => {
-    // Override flash workspace POST to fail so no workspaces exist at all
+    // Fail the Home POST too, so no workspace exists at all
     await mockAPI(page, {
       'GET /workspaces': { workspaces: [], total: 0, limit: 20, offset: 0 },
-      'POST /workspaces/flash': (route) =>
+      'POST /workspaces/home': (route) =>
         route.fulfill({ status: 500, contentType: 'application/json', body: '{"detail":"error"}' }),
     });
     await page.goto('/chat');
@@ -110,6 +110,7 @@ test.describe('Workspace Gallery', () => {
       workspace_id: `a000${String(index).padStart(4, '0')}-0000-4000-8000-000000000000`,
       name: index === 100 ? 'Needle Research' : `Workspace ${index}`,
       status: 'stopped',
+      is_home: false,
       config: {},
       created_at: '2025-01-01T00:00:00Z',
       updated_at: '2025-01-01T00:00:00Z',

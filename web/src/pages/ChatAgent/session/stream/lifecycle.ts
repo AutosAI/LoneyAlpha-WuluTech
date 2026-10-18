@@ -54,10 +54,10 @@ const retryAfterOf = (err: unknown): number | null => {
 };
 
 /** A steer a reload left on screen, still queued or failed: the replay has no
- *  copy of either. */
+ *  copy of either. One still queued may be the status's, drawn as history. */
 const isKeptSteer = (m: { role: string; isHistory?: boolean }): boolean => {
   const steer = m as { steering?: boolean; queueError?: unknown };
-  return m.role === 'user' && !m.isHistory && (!!steer.steering || !!steer.queueError);
+  return m.role === 'user' && (!!steer.steering || (!m.isHistory && !!steer.queueError));
 };
 
 export interface ReconnectOptions {
@@ -123,14 +123,14 @@ export interface RecoveryDeps {
   markTranscriptPersisted: (opts?: { keepQueued?: boolean }) => void;
   clearModelStatus: () => void;
   finalizePendingTodos: (() => void) | null;
-  /** Re-read the machine rows after a turn on a machine; null where there is none (flash). */
-  refreshComputerAfterTurn: (() => void) | null;
-  /** Re-read the workspace row for its folder; null where there is no machine (flash). */
+  /** Re-read the machine rows after a turn. */
+  refreshComputerAfterTurn: () => void;
+  /** Re-read the workspace row for its folder; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
   reportBackWatch: {
     onStreamEnd: () => void;
     arm: (
-      flashThreadId: string | null | undefined,
+      dispatcherThreadId: string | null | undefined,
       reportBackRunId: string | null | undefined,
       pokeSource: string | null,
     ) => void;
@@ -695,7 +695,7 @@ export const reconnectToStream = async (
     // Clear the spinner only if THIS reconnect still owns it. A newer reconnect
     // (cross-thread nav) took ownership and manages its own spinner — clobbering
     // it would hide the new thread's reconnect. Any other teardown that swapped
-    // the stream out from under us (user stop, steering demoted to a new turn)
+    // the stream out from under us (a user stop)
     // leaves ownership with us, so we still clear and never strand the spinner.
     if (rt.isReconnectingOwnerRef.current === abortController) {
       rt.setIsReconnecting(false);
@@ -1043,7 +1043,7 @@ export const cleanupAfterStreamEnd = (
 
   // The server measures the machine's disk when a turn ends, onto the
   // computer row; nothing else re-reads that row while the page is open.
-  if (deps.refreshComputerAfterTurn) deps.refreshComputerAfterTurn();
+  deps.refreshComputerAfterTurn();
   // The router re-reads the workspace row on the run's `metadata` event; a
   // stream attached past that event gets its re-read here.
   if (deps.refreshWorkspaceFolder) deps.refreshWorkspaceFolder();

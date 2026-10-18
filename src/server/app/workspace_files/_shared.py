@@ -33,6 +33,7 @@ from ptc_agent.core.paths import (
 )
 from ptc_agent.core.sandbox.runtime import STREAM_CHUNK_BYTES
 from src.server.database.blob_keys import RELAY_MAX_BYTES
+from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.database.workspace_folders import (
     WorkspaceFolderMoving,
@@ -53,6 +54,7 @@ from src.server.services.persistence.resolve import (
     resolve_file_bytes,
     too_large_to_serve,
 )
+from src.server.utils.api import require_workspace_owner
 from src.server.utils.error_sanitization import (
     sandbox_unreachable_detail,
     single_line,
@@ -121,16 +123,18 @@ _CACHEABLE_IMAGE_TYPES = frozenset(
 )
 
 # DB-backed virtual files: rows the agent reaches through a composite route
-# (UserDataBackend, AutomationsBackend), never files on the sandbox FS. These
-# paths bypass the system-path filter and route to the DB layer. The panel
-# serves them read-only: a write belongs to the owning surface or the agent's
-# route, which make the schema and version checks this generic API cannot.
+# (UserDataBackend, AutomationsBackend, SubagentsBackend), never files on the
+# sandbox FS. These paths bypass the system-path filter and route to the DB
+# layer. The panel serves them read-only: a write belongs to the owning surface
+# or the agent's route, which make the schema and version checks this generic
+# API cannot.
 _VIRTUAL_DIRS = frozenset(USER_DATA_DIRS)
 
 
 def _virtual_file(client_path: str) -> type[DbJsonRoute] | None:
     """The route a path would be a virtual file of, whether or not one is
-    there (an automation's file exists only while its row does)."""
+    there (an automation's or a custom subagent's file exists only while its
+    row does)."""
     return route_for(client_path)
 
 
@@ -324,8 +328,24 @@ def _decode_file_text(raw_bytes: bytes) -> str | None:
     return str(match)
 
 
-def _is_flash_workspace(workspace: dict[str, Any]) -> bool:
-    return workspace.get("status") == "flash"
+# Home joins the user's computer on its first start or turn (ensure_home);
+# until then a request for its files or sandbox has nothing to reach. The
+# reason is the same fact for a response that answers rather than refuses.
+HOME_NOT_ON_COMPUTER = "Home is not on a computer yet"
+HOME_NOT_ON_COMPUTER_REASON = "home_not_on_computer"
+
+
+async def owned_workspace_on_computer(workspace_id: str, user_id: str) -> dict[str, Any]:
+    """The caller's workspace, for a route that reaches its files or sandbox.
+
+    Refused as any owner check refuses, and with a 400 while it is Home not
+    yet on a computer.
+    """
+    workspace = await db_get_workspace(workspace_id)
+    require_workspace_owner(workspace, user_id=user_id)
+    if is_unbound(workspace):
+        raise HTTPException(status_code=400, detail=HOME_NOT_ON_COMPUTER)
+    return workspace
 
 
 async def _acquire_sandbox(
@@ -496,7 +516,7 @@ def _is_serve_blocked_path(client_path: str) -> bool:
     ``mcp_servers``, ``_internal``, ...) that those endpoints deliberately hide.
 
     Stricter than the panel: it skips ``_is_system_path``'s carve-out for the
-    user's profile and automation files. Their owner reads them through the
+    user's profile, automation and subagent files. Their owner reads them through the
     file routes, never this core, and the file mount links them into every
     workspace folder, so only containment would stand between a share link and
     the user's holdings.

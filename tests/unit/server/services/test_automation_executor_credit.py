@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.services.automation_executor import AutomationExecutor
 
 # ---------------------------------------------------------------------------
@@ -29,16 +30,16 @@ _USER_ID = "user-test-placeholder"
 _AUTO_ID = "auto-test-placeholder"
 _EXEC_ID = "exec-test-placeholder"
 _WS_ID = "ws-test-placeholder"
+_HOME = get_home_workspace_id(_USER_ID)
 
 
-def _make_automation(agent_mode="flash", **overrides):
+def _make_automation(workspace_id=_WS_ID, **overrides):
     data = {
         "automation_id": _AUTO_ID,
         "user_id": _USER_ID,
-        "agent_mode": agent_mode,
         "instruction": "Summarize today's market",
         "trigger_type": "cron",
-        "workspace_id": _WS_ID if agent_mode == "ptc" else None,
+        "workspace_id": workspace_id,
         "thread_strategy": "new",
         "conversation_thread_id": None,
         "llm_model": None,
@@ -74,23 +75,23 @@ _PATCHES = {
 }
 
 
+_ROWS = {
+    ws_id: {"workspace_id": ws_id, "user_id": _USER_ID, "status": "running"}
+    for ws_id in (_WS_ID, _HOME)
+}
+
+
 @contextmanager
 def _route_reads():
-    """The rows the turn route reads, with the all-workspaces agent off."""
+    """The rows the turn route reads, and the Home bind."""
     with (
         patch(
-            "src.server.services.turn_runtime.home_enabled",
-            new=AsyncMock(return_value=False),
-        ),
-        patch(
-            "src.server.database.workspace.get_or_create_flash_workspace",
-            new=AsyncMock(return_value={"workspace_id": _WS_ID}),
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            return_value=MagicMock(ensure_home_bound=AsyncMock()),
         ),
         patch(
             "src.server.database.workspace.get_workspace",
-            new=AsyncMock(
-                return_value={"workspace_id": _WS_ID, "user_id": _USER_ID, "status": "running"}
-            ),
+            new=AsyncMock(side_effect=_ROWS.get),
         ),
     ):
         yield
@@ -160,7 +161,7 @@ class TestCredentialGate:
     """AutomationExecutor passes correct is_byok and credit gate to workflows."""
 
     @pytest.mark.asyncio
-    async def test_byok_only_user_flash(self):
+    async def test_byok_only_user_home(self):
         """BYOK-only user: enforce_credit called with byok=True, workflow gets is_byok=True."""
         patches = _patch_all(is_byok=True, has_oauth=False)
 
@@ -175,14 +176,14 @@ class TestCredentialGate:
             patches["settlement_webhook"],
             patches["get_run"],
             patch(
-                "src.server.handlers.chat.astream_flash_workflow",
+                "src.server.handlers.chat.astream_ptc_workflow",
                 side_effect=_empty_async_gen,
             ) as mock_astream,
         ):
             _setup_auto_db(mock_adb)
 
             executor = AutomationExecutor()
-            automation = _make_automation(agent_mode="flash")
+            automation = _make_automation(workspace_id=_HOME)
             await executor.execute(automation, _EXEC_ID)
 
         mock_byok.assert_awaited_once_with(_USER_ID)
@@ -191,7 +192,7 @@ class TestCredentialGate:
         _assert_astream_called_with_byok(mock_astream, expected_byok=True)
 
     @pytest.mark.asyncio
-    async def test_oauth_only_user_flash(self):
+    async def test_oauth_only_user_home(self):
         """OAuth-only user: credit gate sees has_cred=True (not mis-gated as a
         platform user), but the workflow gets is_byok=False — the BYOK ladder is
         not attempted for a user with no BYOK keys."""
@@ -208,14 +209,14 @@ class TestCredentialGate:
             patches["settlement_webhook"],
             patches["get_run"],
             patch(
-                "src.server.handlers.chat.astream_flash_workflow",
+                "src.server.handlers.chat.astream_ptc_workflow",
                 side_effect=_empty_async_gen,
             ) as mock_astream,
         ):
             _setup_auto_db(mock_adb)
 
             executor = AutomationExecutor()
-            automation = _make_automation(agent_mode="flash")
+            automation = _make_automation(workspace_id=_HOME)
             await executor.execute(automation, _EXEC_ID)
 
         mock_oauth.assert_awaited_once_with(_USER_ID)
@@ -226,7 +227,7 @@ class TestCredentialGate:
         _assert_astream_called_with_byok(mock_astream, expected_byok=False)
 
     @pytest.mark.asyncio
-    async def test_no_cred_user_flash(self):
+    async def test_no_cred_user_home(self):
         """Neither BYOK nor OAuth: enforce_credit called with byok=False (platform path)."""
         patches = _patch_all(is_byok=False, has_oauth=False)
 
@@ -241,14 +242,14 @@ class TestCredentialGate:
             patches["settlement_webhook"],
             patches["get_run"],
             patch(
-                "src.server.handlers.chat.astream_flash_workflow",
+                "src.server.handlers.chat.astream_ptc_workflow",
                 side_effect=_empty_async_gen,
             ) as mock_astream,
         ):
             _setup_auto_db(mock_adb)
 
             executor = AutomationExecutor()
-            automation = _make_automation(agent_mode="flash")
+            automation = _make_automation(workspace_id=_HOME)
             await executor.execute(automation, _EXEC_ID)
 
         mock_credit.assert_awaited_once_with(_USER_ID, byok=False)
@@ -256,8 +257,8 @@ class TestCredentialGate:
         _assert_astream_called_with_byok(mock_astream, expected_byok=False)
 
     @pytest.mark.asyncio
-    async def test_byok_only_user_ptc(self):
-        """BYOK-only user running PTC automation: workflow gets is_byok=True."""
+    async def test_byok_only_user_in_a_workspace(self):
+        """BYOK-only user running an automation in a workspace: workflow gets is_byok=True."""
         patches = _patch_all(is_byok=True, has_oauth=False)
 
         with (
@@ -278,7 +279,7 @@ class TestCredentialGate:
             _setup_auto_db(mock_adb)
 
             executor = AutomationExecutor()
-            automation = _make_automation(agent_mode="ptc")
+            automation = _make_automation()
             await executor.execute(automation, _EXEC_ID)
 
         mock_credit.assert_awaited_once_with(_USER_ID, byok=True)
@@ -357,12 +358,12 @@ async def _gated(exc):
         patches["settlement_webhook"] as mock_settled,
         patches["get_run"],
         patch(
-            "src.server.handlers.chat.astream_flash_workflow",
+            "src.server.handlers.chat.astream_ptc_workflow",
             side_effect=_empty_async_gen,
         ) as mock_astream,
     ):
         _setup_auto_db(mock_adb)
-        await AutomationExecutor().execute(_make_automation(agent_mode="flash"), _EXEC_ID)
+        await AutomationExecutor().execute(_make_automation(workspace_id=_HOME), _EXEC_ID)
     return mock_adb, mock_astream, mock_settled
 
 
@@ -384,7 +385,7 @@ class TestAdmitted:
             patches["settlement_webhook"] as mock_settled,
             patches["get_run"] as mock_get_run,
             patch(
-                "src.server.handlers.chat.astream_flash_workflow",
+                "src.server.handlers.chat.astream_ptc_workflow",
                 side_effect=_one_event_gen,
             ) as mock_astream,
         ):

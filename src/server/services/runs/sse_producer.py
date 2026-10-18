@@ -281,10 +281,6 @@ class RunSSEProducer:
         # Event sequence numbering for reconnection support
         self.event_sequence: int = 0
 
-        # Track steering messages injected mid-workflow (for query backfill)
-        self.injected_steerings: list[dict] = []
-        self.on_steering_delivered: Optional[Any] = None
-
         self.event_counter: Optional[Any] = None
 
         # Track message IDs that have already emitted content via AIMessageChunk streaming.
@@ -564,11 +560,12 @@ class RunSSEProducer:
                                         "total_tokens", "summary_length", "summary_text",
                                         "original_message_count", "source",
                                         "summary_tokens", "truncated_count", "error",
-                                        "kind", "offloaded_args", "offloaded_reads"):
+                                        "kind", "offloaded_args", "offloaded_reads",
+                                        "threshold"):
                                 if key in event_data:
                                     cw_data[key] = event_data[key]
                             if event_data.get("action") == "token_usage":
-                                cw_data["threshold"] = self._resolve_token_threshold()
+                                cw_data.setdefault("threshold", self._resolve_token_threshold())
 
                             action = event_data.get("action", "")
                             signal = event_data.get("signal", "")
@@ -602,7 +599,11 @@ class RunSSEProducer:
                                 event_data, agent_from_stream
                             )
                             self.provenance_events.append(
-                                {"event": "provenance", "data": dict(prov_data)}
+                                {
+                                    "event": "provenance",
+                                    "data": dict(prov_data),
+                                    "ts": time.time(),
+                                }
                             )
                             yield self._build_sse_event("provenance", prov_data)
                             continue
@@ -615,14 +616,6 @@ class RunSSEProducer:
                                 "messages": event_data.get("messages", []),
                                 "timestamp": event_data.get("timestamp"),
                             })
-                            # Track injected messages for later query backfill
-                            if self.on_steering_delivered:
-                                try:
-                                    await self.on_steering_delivered(
-                                        event_data.get("messages", [])
-                                    )
-                                except Exception:
-                                    pass
                             continue
 
                         # ``model_fallback`` arrives as a langgraph ui record

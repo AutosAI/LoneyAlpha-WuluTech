@@ -25,6 +25,10 @@ from ptc_agent.agent.middleware._message_utils import (
     message_id,
 )
 from ptc_agent.agent.middleware.skills.content import skill_bodies
+from ptc_agent.agent.middleware.skills.registry import (
+    RETIRED_SKILLS,
+    skills_outside_sandbox,
+)
 from ptc_agent.agent.transcript import TranscriptTarget
 from ptc_agent.agent.transcript.classify import LEGACY_SUMMARY_PREFIX, is_summary_message
 from ptc_agent.agent.transcript.pointer import SummarySpan, transcript_note
@@ -690,6 +694,54 @@ _SUMMARY_SOURCE = "summarization"
 #: summarizes it: the span of turns, and the skills its note listed.
 SUMMARIZED_KEY = "summarized"
 
+#: The ``response_metadata`` key holding the summary trigger a model call ran
+#: under. The trigger is per turn (the user's or the model's compaction
+#: preset), and the checkpoint is all replay has of the turn, so it rides on
+#: the response whose usage the ring shows.
+CONTEXT_THRESHOLD_KEY = "context_threshold"
+
+
+def stamp_context_threshold(message: AIMessage, threshold: int) -> None:
+    message.response_metadata = {
+        **(message.response_metadata or {}),
+        CONTEXT_THRESHOLD_KEY: threshold,
+    }
+
+
+def context_threshold(message: Any) -> int | None:
+    """The summary trigger stamped on ``message``, or None for a message
+    saved before the stamp."""
+    value = (getattr(message, "response_metadata", None) or {}).get(CONTEXT_THRESHOLD_KEY)
+    return value if isinstance(value, int) and value > 0 else None
+
+
+#: The ``response_metadata`` key holding the summary a model call compacted
+#: to before it ran. The summary message lives only in
+#: ``_summarization_event``, which the next compaction overwrites, so each
+#: summary, and where in the turn it fired, rides on the response that
+#: answered from it.
+COMPACTION_SUMMARY_KEY = "context_summary"
+
+
+def stamp_compaction_summary(
+    message: AIMessage, summary_message_id: str, fields: Mapping[str, Any]
+) -> None:
+    """Stamp ``fields``, the summarize complete signal's payload, on the
+    response to the call that compacted to ``summary_message_id``."""
+    message.response_metadata = {
+        **(message.response_metadata or {}),
+        COMPACTION_SUMMARY_KEY: {"summary_message_id": summary_message_id, **fields},
+    }
+
+
+def compaction_summary(message: Any) -> dict[str, Any] | None:
+    """The summary stamped on ``message``, or None for a response whose call
+    did not compact or that was saved before the stamp."""
+    value = (getattr(message, "response_metadata", None) or {}).get(COMPACTION_SUMMARY_KEY)
+    if isinstance(value, dict) and isinstance(value.get("summary_message_id"), str):
+        return value
+    return None
+
 
 def build_summary_message(
     summary: str,
@@ -699,7 +751,6 @@ def build_summary_message(
     span: SummarySpan | None = None,
     index: Sequence[str] = (),
     skills: Sequence[str] = (),
-    skill_files: bool = False,
     source: str = "model",
     notes: str = "",
 ) -> HumanMessage:
@@ -717,7 +768,7 @@ def build_summary_message(
     content = f"{CONTEXT_SUMMARY_PREFIX}{summary}"
     if transcript is not None:
         content += transcript_note(transcript, span, index)
-    content += skill_reload_note(list(skills), files=skill_files)
+    content += skill_reload_note(list(skills))
     content += notes
 
     return HumanMessage(
@@ -769,7 +820,9 @@ def listed_skills(messages: Iterable[Any]) -> list[str]:
     ]
 
 
-def compacted_skills(summarized: Any, kept: Any) -> list[str]:
+def compacted_skills(
+    summarized: Any, kept: Any, user_skills: Iterable[str] = ()
+) -> list[str]:
     """Skills whose body a summary replaces and no kept message still carries
     whole.
 
@@ -778,30 +831,28 @@ def compacted_skills(summarized: Any, kept: Any) -> list[str]:
     body, only the names its note listed, and those skills are still out of
     context unless a kept message has read one again; dropping them would lose
     them for good.
+
+    A built-in the sandbox does not carry (a hidden one, which only the host
+    injects, one switched off, or a retired one) has no SKILL.md to read back,
+    so it is left out rather than sending the agent to a file that is not there.
+    A retired name is free for the user to take, and one of ``user_skills``
+    by that name has a file like any other.
     """
     still = {name for name, whole in skill_bodies(kept).items() if whole}
+    no_file = skills_outside_sandbox() | (RETIRED_SKILLS - set(user_skills))
     names = dict.fromkeys([*listed_skills(summarized), *skill_bodies(summarized)])
-    return [name for name in names if name not in still]
+    return [name for name in names if name not in still and name not in no_file]
 
 
-def skill_reload_note(names: list[str], *, files: bool) -> str:
-    """What a summary tells the agent about skills it may still be following.
-
-    ``files`` is whether the agent reaches skills as files (PTC, where a Read
-    of SKILL.md loads one) rather than through LoadSkill (Flash).
-    """
+def skill_reload_note(names: list[str]) -> str:
+    """What a summary tells the agent about skills it may still be following."""
     if not names:
         return ""
     listed = ", ".join(f"`{name}`" for name in names)
-    how = (
-        "Read its `.agents/skills/<name>/SKILL.md` again"
-        if files
-        else "call LoadSkill with its name"
-    )
     return (
         f"\n\nThe instructions of these skills were in the summarized part and "
         f"are no longer in your context: {listed}. Before you continue with one "
-        f"you are still following, {how}."
+        f"you are still following, Read its `.agents/skills/<name>/SKILL.md` again."
     )
 
 

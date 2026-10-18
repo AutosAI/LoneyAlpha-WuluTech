@@ -15,10 +15,10 @@ import {
   type TranscriptDisplay,
 } from '@/lib/transcriptDisplay';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
-import { useAllWorkspacesAgent } from '@/hooks/useAllWorkspacesAgent';
-import { FLASH_ROUTE_STATE } from '@/hooks/useFlashWorkspace';
+import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { invalidateSubagents } from '@/hooks/useSubagents';
 import { useLocale } from '@/hooks/useLocale';
 import { onboardingKickoff } from '@/pages/Onboarding/connect/kickoff';
 import { cardDownloadKey, trackPending } from '../utils/downloadNotice';
@@ -35,7 +35,7 @@ import { saveChatSession, getChatSession, clearChatSession } from '../hooks/util
 import type { PreviewData } from '../hooks/utils/types';
 import { useCardState } from '../hooks/useCardState';
 import { useWorkspace } from '@/hooks/useWorkspace';
-import { classifyAgentPath } from '../utils/agentPaths';
+import { classifyAgentPath, isSubagentFilePath } from '../utils/agentPaths';
 import { fileArtifactPath } from '../utils/fileArtifact';
 import type { FileOperationArtifactPayload } from '@/types/api';
 import { taskIdFromAgentId } from '../utils/agentId';
@@ -64,6 +64,7 @@ import { DispatchStatusProvider } from '../hooks/usePTCDispatchStatus';
 import JumpToLatestPill from './JumpToLatestPill';
 import ShareButton from './ShareButton';
 import { WorkspaceProvider } from '../contexts/WorkspaceContext';
+import { ShareLinkOpenerContext } from '../contexts/ShareLinkOpenerContext';
 import { RouteLeaveGuardContext } from '../contexts/RouteLeaveGuardContext';
 import SubagentStatusBar from './SubagentStatusBar';
 import TodoDrawer from './TodoDrawer';
@@ -92,7 +93,6 @@ import { ChatDiskWarning } from './chatView/ChatDiskWarning';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
 import { useNavPanel } from './chatView/useNavPanel';
 import { MobileNavDrawer } from './chatView/MobileNavDrawer';
-import { resolveChatMode } from './chatView/chatMode';
 import { useChatScroll } from './chatView/useChatScroll';
 import { OlderHistoryRow } from './chatView/OlderHistoryRow';
 import { isTurnOpen, useTranscriptFollow } from './chatView/useTranscriptFollow';
@@ -121,42 +121,28 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const navigate = useNavigate();
   const { preferences } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
-  const allWorkspacesAgent = useAllWorkspacesAgent();
   const queryClient = useQueryClient();
   const initialMessageSentRef = useRef(false);
   const state = location.state as LocationState | null;
-  // The workspace row drives the header title and the flash-mode fallback. It
+  // The workspace row drives the header title and names Home. It
   // has to come from the shared detail query rather than a mount-time snapshot:
   // a rename invalidates that key, and this view outlives the rename (it is
   // kept mounted by the ChatView LRU, whose own copy of the name never
   // refreshes). The prop is only the pre-fetch seed.
   const { data: workspaceRecord } = useWorkspace(workspaceId);
 
-  // Agent mode: what the navigation asked for, else what the workspace row
-  // says (resolveChatMode).
-  //
-  // Both route-state reads are captured at mount. ChatAgent keeps up to five
-  // ChatViews rendered at once (display:none, not unmounted) and they all read
-  // the same current location, so a live read would hand every background view
-  // the mode of whatever thread the user just opened. `workspaceStatus` needs
-  // the same freeze and cannot simply be dropped: three navigations set it
-  // without an `agentMode` beside it (the sidebar's workspace-home jump, the
-  // archive fallback, and the gallery hops that inherit state).
-  const [navMode] = useState(() => ({
-    agentMode: state?.agentMode,
-    isFlash: state?.workspaceStatus === 'flash',
-  }));
-  const { isHome, agentMode, isFlashMode, dispatches } = resolveChatMode({
-    allWorkspacesAgent,
-    navAgentMode: navMode.agentMode,
-    navIsFlash: navMode.isFlash,
-    rowStatus: workspaceRecord?.status,
-  });
-  // Home is named for what it stands for, also before its row has loaded.
+  // Home, named by its row. Home runs the Chief of Staff as a full agent,
+  // and it dispatches work into other workspaces: PTC cards open the threads
+  // it started, report-backs land here, and file links reach into the
+  // workspaces that wrote them.
+  const isHome = isHomeWorkspace(workspaceRecord);
+  // Home is named for what it stands for.
   const workspaceName = (isHome ? t('agents.allWorkspaces') : workspaceRecord?.name) || initialWorkspaceName || '';
 
-  // The model a navigation's first message goes out with, frozen for the same
-  // reason as navMode; the auto-send below clears the route state.
+  // The model a navigation's first message goes out with, captured at mount:
+  // ChatAgent keeps up to five ChatViews rendered at once (display:none, not
+  // unmounted) and they all read the same current location, and the
+  // auto-send below clears the route state.
   const [navModel] = useState(() => (typeof state?.model === 'string' && state.model ? state.model : null));
   // The navigation bringing a new thread's first message, with the landing
   // composer's Subagents pick. Read per navigation rather than frozen: a new
@@ -214,11 +200,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   );
 
   // Navigate to a newly created workspace with an optional starter question
-  // Always PTC mode — start_question creates a sandbox-backed workspace
   const handleWorkspaceCreated = useCallback(({ workspaceId: newWsId, question }: { workspaceId?: string; question?: string }) => {
     if (!newWsId) return;
     const path = `/chat/t/__default__`;
-    const navState = { workspaceId: newWsId, agentMode: 'ptc', ...(question ? { initialMessage: question } : {}) };
+    const navState = { workspaceId: newWsId, ...(question ? { initialMessage: question } : {}) };
     navigate(path, { state: navState });
   }, [navigate]);
 
@@ -227,7 +212,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const {
     override: filePanelWorkspaceId,
     setOverride: setFilePanelWorkspaceId,
-    shownWorkspaceId: effectiveFileWorkspaceId,
+    shownWorkspaceId: panelWorkspaceId,
     files: workspaceFiles,
     loading: filesLoading,
     error: filesError,
@@ -235,11 +220,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     refreshOwn: refreshOwnFiles,
     mentionFiles,
     panelAccess: filePanelAccess,
-  } = usePanelFiles({ isHome, isFlashMode, workspaceId, workspaceName, includeSystem: showSystemFiles });
+  } = usePanelFiles({ isHome, workspaceId, workspaceName, includeSystem: showSystemFiles });
   // A path names a sibling by its folder from the workspace it was written
   // in: the chat's for the transcript, the panel's for the files it shows.
   const chatFolders = useComputerFolders(workspaceId);
-  const panelWorkspaceId = effectiveFileWorkspaceId || workspaceId;
   const otherPanelFolders = useComputerFolders(panelWorkspaceId === workspaceId ? null : panelWorkspaceId);
   const panelFolders = panelWorkspaceId === workspaceId ? chatFolders : otherPanelFolders;
 
@@ -256,14 +240,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     const filePath = fileArtifactPath(event?.payload as FileOperationArtifactPayload | undefined);
     if (!filePath) return;
     const info = classifyAgentPath(filePath);
-    // PTC and Home write their own memory, whichever workspace the panel shows.
-    const memoryWorkspaceId = isFlashMode ? effectiveFileWorkspaceId : workspaceId;
+    // The agent writes its own memory, whichever workspace the panel shows.
     if (info.kind === 'memory') {
       if (info.tier === 'user') {
         queryClient.invalidateQueries({ queryKey: queryKeys.memory.user() });
-      } else if (memoryWorkspaceId) {
+      } else if (workspaceId) {
         queryClient.invalidateQueries({
-          queryKey: queryKeys.memory.workspace(memoryWorkspaceId),
+          queryKey: queryKeys.memory.workspace(workspaceId),
         });
       }
     } else if (info.kind === 'memo') {
@@ -273,7 +256,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       // server writes on save, and the turn may write several.
       profileWrittenRef.current = true;
     }
-  }, [refreshOwnFiles, queryClient, isFlashMode, workspaceId, effectiveFileWorkspaceId]);
+    // The Subagents pane is a page away, so this only marks its list stale
+    // for the way back.
+    if (isSubagentFilePath(filePath)) invalidateSubagents(queryClient);
+  }, [refreshOwnFiles, queryClient, workspaceId]);
 
   // Stable ref-based callback for opening preview URLs from SSE events.
   // Defined here so it can be passed to useChatMessages; assigned after
@@ -285,7 +271,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   // Chat messages management - receives updateTodoListCard and updateSubagentCard from floating cards hook.
   // Send, edit, regenerate and retry come from useTranscriptFollow below.
-  const chat = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleFileArtifact, handleOpenPreviewFromStream, agentMode, clearSubagentCards, handleWorkspaceCreated, 'web');
+  const chat = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleFileArtifact, handleOpenPreviewFromStream, clearSubagentCards, handleWorkspaceCreated, 'web');
   const {
     messages,
     liveMessages,
@@ -347,17 +333,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     sendSubagentInstruction,
   } = chat;
 
-  const composerMode = isFlashMode ? 'fast' : 'ptc';
   const threadModel = useThreadModel({
     threadId: currentThreadId,
-    mode: composerMode,
     isLoading,
     initialModel: navModel,
   });
   const { pickModel: pickThreadModel } = threadModel;
   const threadSubagents = useThreadSubagents({
     threadId: currentThreadId,
-    mode: composerMode,
     landing: subagentsLanding,
   });
   const { toSend: subagentsToSend } = threadSubagents;
@@ -868,6 +851,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     activeTabKind,
     leaveFiles,
     handleOpenPreview,
+    handleOpenShareLink,
     handleOpenChart,
     handleOpenInMarketView,
     detailToolCall,
@@ -882,8 +866,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     containerRef,
     setFilePanelWorkspaceId,
     filePanelWorkspaceId,
-    dispatches,
-    isHome,
     messages,
     subagentTranscripts,
     watching: showWatchChip,
@@ -905,7 +887,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     hasActiveSubagents,
     reportBackOwed,
     owedThreads: reportBackOwedThreads,
-    mode: isHome ? 'home' : isFlashMode ? 'flash' : 'ptc',
+    isHome,
   });
   // A roster task the page only knows from history or its report has no card
   // yet: open it the way its inline card would, which loads its transcript,
@@ -969,19 +951,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, [workspaceId, downloadKeyFor, getRecentWritePaths, handleOpenFileFromChat, t]);
 
   // The thread that handed this one its turn, reached the same way from the
-  // back button and from the label over a hand-off in the transcript: Flash's,
-  // or under the all-workspaces agent Home's (the flash row's route state names
-  // either, resolveChatMode). The workspace rides along when this thread was
-  // opened from that one; otherwise the route looks it up.
+  // back button and from the label over a hand-off in the transcript: Home's.
+  // The workspace rides along when this thread was opened from that one;
+  // otherwise the route looks it up.
   const fromThreadId = state?.fromThreadId;
   const fromWorkspaceId = state?.fromWorkspaceId;
   const openDispatcher = useCallback((dispatcherThreadId: string) => {
     intentionalExitRef.current = true;
     navigate(`/chat/t/${dispatcherThreadId}`, {
-      state: {
-        ...(dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {}),
-        ...FLASH_ROUTE_STATE,
-      },
+      state: dispatcherThreadId === fromThreadId && fromWorkspaceId ? { workspaceId: fromWorkspaceId } : {},
     });
   }, [navigate, fromThreadId, fromWorkspaceId]);
 
@@ -1022,10 +1000,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   });
 
   // The dispatcher's deep-link context for PTC-agent proposal cards. Memoized:
-  // a fresh object per render would defeat the bubble memo in flash mode.
-  const flashContext = useMemo(
-    () => (dispatches && currentThreadId ? { threadId: currentThreadId, workspaceId } : null),
-    [dispatches, currentThreadId, workspaceId],
+  // a fresh object per render would defeat the bubble memo in Home.
+  const dispatcherContext = useMemo(
+    () => (isHome && currentThreadId ? { threadId: currentThreadId, workspaceId } : null),
+    [isHome, currentThreadId, workspaceId],
   );
 
 
@@ -1255,19 +1233,22 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [location.state, workspaceId, threadId, isLoading, isLoadingHistory, handleSendMessage, navigate, location.pathname, isActive, subagentsToSend]);
 
-  // Re-seed the widget context deck from navigation state when there's no
+  // Re-seed the composer from navigation state when there's no
   // initialMessage (the auto-send branch above already consumes them inline).
   // Used by the ContextOverflowPill click handoff: dashboard → /chat with
-  // queued widget cards but no auto-send.
-  const widgetSnapshotReseedRef = useRef(false);
+  // queued widget cards but no auto-send. And by Plugins → Subagents' "Create
+  // with the agent", which hands it a sentence to finish rather than send.
+  const composerReseedRef = useRef(false);
   useEffect(() => {
-    if (widgetSnapshotReseedRef.current) return;
+    if (composerReseedRef.current) return;
     const navState = location.state as LocationState | null;
     const snaps = navState?.widgetSnapshots;
-    if (!snaps?.length || navState?.initialMessage) return;
-    widgetSnapshotReseedRef.current = true;
-    snaps.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
-    navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined } });
+    const draft = navState?.draftMessage;
+    if ((!snaps?.length && !draft) || navState?.initialMessage) return;
+    composerReseedRef.current = true;
+    snaps?.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
+    if (draft) chatInputRef.current?.setValue(draft);
+    navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined } });
   }, [location.state, location.pathname, navigate]);
 
 
@@ -1362,6 +1343,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         panel beside it, so it leaves through the panel's guard like the
         panel's own exits do. */}
     <RouteLeaveGuardContext value={leaveFiles}>
+    <ShareLinkOpenerContext value={handleOpenShareLink}>
     {/* `h-full`, never `h-screen`: this fills the shell's content column, which
         is the viewport only when nothing else is in it. Pinning it to 100vh
         pushes it out of its own box the moment anything is (the offline
@@ -1412,7 +1394,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     ? t('chat.backToWorkflow', 'Back to workflow')
                     : t('chat.backToMain', 'Back to main')
                   : state?.fromThreadId
-                    ? allWorkspacesAgent ? t('agents.backToChiefOfStaff') : t('chat.backToFlash', 'Back to Flash')
+                    ? t('agents.backToChiefOfStaff')
                     : t('workspace.backToThreads')
               }
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
@@ -1442,20 +1424,18 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
           <div className="flex items-center gap-2">
             {currentThreadId && currentThreadId !== '__default__' && (
-              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={isFlashMode ? null : workspaceId} />
+              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
-            {(!isFlashMode || filePanelWorkspaceId) && (
-              <button
-                onClick={handleToggleFilePanel}
-                className="p-2 rounded-md transition-colors"
-                style={{ color: 'var(--color-text-primary)', backgroundColor: rightPanelType === 'file' ? 'var(--color-border-muted)' : undefined }}
-                title={t('chat.workspaceFiles')}
-                onMouseEnter={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
-                onMouseLeave={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = ''; }}
-              >
-                <FolderOpen className="h-5 w-5" />
-              </button>
-            )}
+            <button
+              onClick={handleToggleFilePanel}
+              className="p-2 rounded-md transition-colors"
+              style={{ color: 'var(--color-text-primary)', backgroundColor: rightPanelType === 'file' ? 'var(--color-border-muted)' : undefined }}
+              title={t('chat.workspaceFiles')}
+              onMouseEnter={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
+              onMouseLeave={(e) => { if (rightPanelType !== 'file') e.currentTarget.style.backgroundColor = ''; }}
+            >
+              <FolderOpen className="h-5 w-5" />
+            </button>
           </div>
         </div>
 
@@ -1533,7 +1513,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                             isLoading={isLoading}
                             isLoadingHistory={isLoadingHistory}
                             feedbackByTurn={feedbackByTurn}
-                            flashContext={flashContext}
+                            dispatcherContext={dispatcherContext}
                           />
                         </DispatchStatusProvider>
                       </MessageActionsProvider>
@@ -1682,7 +1662,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         phase={trayPhase}
                         trayRef={trayRef}
                         dockRef={trayDockRef}
-                        from={flashContext}
+                        from={dispatcherContext}
                         onOpenTask={openTaskFromTray}
                         onOpenWatch={handleOpenStatusFromChat}
                       />
@@ -1691,7 +1671,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     {messageError && (!isLoading || (typeof messageError === 'object' && messageError.kind === 'notice')) && (
                       <ErrorBanner error={messageError} />
                     )}
-                    {!isFlashMode && workspaceRecord?.computer_id && (
+                    {workspaceRecord?.computer_id && (
                       <ChatDiskWarning computerId={workspaceRecord.computer_id} />
                     )}
                     <FallbackSuggestionPill
@@ -1701,7 +1681,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       onSwitchModel={handleSwitchModel}
                       onDismiss={clearFallbackSuggestion}
                     />
-                    <ThreadOffers model={threadModel} subagents={threadSubagents} mode={composerMode} />
+                    <ThreadOffers model={threadModel} subagents={threadSubagents} />
                     <SelectionChips chips={chartSelectionChips} />
                     {/* One row: the drawer is a tab tucked under the composer's top
                         edge, so no status row may come between them, and the
@@ -1728,7 +1708,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         threadModels={threadModels}
                         subagentsAllowed={threadSubagents.allowed}
                         onToggleSubagents={threadSubagents.setAllowed}
-                        mode={composerMode}
                         selectedWorkspaceId={workspaceId}
                         toolbarStatus={trayContents && (
                           <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />
@@ -1825,7 +1804,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               <Suspense fallback={null}>
                 <WorkspaceProvider workspaceId={panelWorkspaceId} downloadFile={null} folders={panelFolders}>
                 <FilePanel
-                  workspaceId={effectiveFileWorkspaceId || workspaceId}
+                  workspaceId={panelWorkspaceId}
                   threadId={panelThreadId}
                   isActive={isActive}
                   onClose={() => { setRightPanelType(null); popPanelHistory(); }}
@@ -1887,7 +1866,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   {rightPanelType === 'file' ? (
                     <WorkspaceProvider workspaceId={panelWorkspaceId} downloadFile={null} folders={panelFolders}>
                     <FilePanel
-                      workspaceId={effectiveFileWorkspaceId || workspaceId}
+                      workspaceId={panelWorkspaceId}
                       threadId={panelThreadId}
                       isActive={isActive}
                       onClose={() => { setRightPanelType(null); popPanelHistory(); }}
@@ -1928,6 +1907,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       )}
 
     </div>
+    </ShareLinkOpenerContext>
     </RouteLeaveGuardContext>
     </WorkspaceProvider>
   );

@@ -10,12 +10,8 @@ import { MessageProvenanceLabel } from '../MessageProvenance';
 import { MessageActionsProvider, type MessageActions } from '../MessageActionsContext';
 import MessageList from '../../MessageList';
 import type { MessageProvenance } from '@/types/chat';
+import { deliveredEntryRow } from '../../../session/stream/steeringDelivery';
 import type { MessageRecord } from '../types';
-
-let allWorkspaces = false;
-vi.mock('@/hooks/useAllWorkspacesAgent', () => ({
-  useAllWorkspacesAgent: () => allWorkspaces,
-}));
 
 vi.mock('@/hooks/useUser', () => ({
   useUser: () => ({ user: null }),
@@ -71,20 +67,24 @@ describe('MessageProvenanceLabel', () => {
     expect(onOpenDispatcher).toHaveBeenCalledWith('th-home');
   });
 
-  it('reads an unrecorded dispatcher off the current flag', () => {
-    allWorkspaces = false;
-    const { unmount } = renderLabel({ kind: 'agent', agent: null, threadId: 'th-old' });
-    expect(screen.getByText('From Flash')).toBeInTheDocument();
-    unmount();
-    allWorkspaces = true;
-    renderLabel({ kind: 'agent', agent: null, threadId: 'th-old' });
+  it('labels a steer the Chief of Staff sent into a running turn, without a link to its Home thread', () => {
+    const row = deliveredEntryRow(
+      { content: 'add the margin bridge', origin: { type: 'agent', agent: 'chief_of_staff' }, request_key: 'rk-cos' },
+      () => 'row',
+      2,
+    );
+    renderLabel(row!.provenance!, { actions: { onOpenDispatcher: vi.fn() } });
     expect(screen.getByText('From Chief of Staff')).toBeInTheDocument();
-    allWorkspaces = false;
+    expect(screen.queryByRole('button')).toBeNull();
   });
 
-  it('leaves an unrecorded dispatcher unlabelled in a share, which has no flags of its owner', () => {
+  it('reads an unrecorded dispatcher as the Chief of Staff', () => {
+    renderLabel({ kind: 'agent', agent: null, threadId: 'th-old' });
+    expect(screen.getByText('From Chief of Staff')).toBeInTheDocument();
+  });
+
+  it('leaves an unrecorded dispatcher unlabelled in a share', () => {
     renderLabel({ kind: 'agent', agent: null, threadId: 'th-old' }, { readOnly: true });
-    expect(screen.queryByText('From Flash')).not.toBeInTheDocument();
     expect(screen.queryByText('From Chief of Staff')).not.toBeInTheDocument();
   });
 

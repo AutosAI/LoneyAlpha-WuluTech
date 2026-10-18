@@ -1,13 +1,13 @@
 """Shared machinery for synthetic notification turns.
 
 Two dispatch relationships post system-authored turns into a watching
-thread when background work finishes: flash←PTC report-backs and
+thread when background work finishes: Chief of Staff←PTC report-backs and
 PTC←background-subagent task report-backs. Both need the same transport
 discipline: a park while the receiving thread is busy, an admission-aware
 POST defer loop bounded by the outbox lease, and a terminal wait that holds
 the job (and thus the per-thread ordering chain) open until the
 notification turn settles. The pending-registries deliberately stay
-separate (Redis reserve machinery for flash, open outbox rows for tasks);
+separate (Redis reserve machinery for hand-offs, open outbox rows for tasks);
 only this turn machinery is shared.
 """
 
@@ -96,8 +96,9 @@ async def post_notification_turn(
     set), ``"drop"`` (terminal 4xx), ``"cap"`` (exhausted defer-wait — the
     target may simply be busy; the caller picks drop vs park), ``"deleted"``
     (target thread 404), ``"lost"`` (the ``heartbeat`` fence failed —
-    caller must stop with no teardown), or ``"superseded"`` (``still_due``
-    said no; no turn was started). Defers with backoff on 409, >=500,
+    caller must stop with no teardown), ``"superseded"`` (``still_due``
+    said no; no turn was started), or ``"taken"`` (START refused the steer
+    the body carries: a live turn took it, or it already ended). Defers with backoff on 409, >=500,
     and ``DEFER_STATUSES``, bounded by ``wait_cap`` — except a 409 whose
     detail is ``duplicate_request``: that's a prior POST of this same
     ``request_key`` that already started a run, adopted as ``"dispatched"``.
@@ -192,6 +193,15 @@ async def post_notification_turn(
                                 f"thread {thread_id} (request_key dedup)"
                             )
                             return "dispatched", detail["run_id"]
+                        if (
+                            isinstance(detail, dict)
+                            and detail.get("code") == "steer_taken"
+                        ):
+                            logger.info(
+                                f"{log_prefix} {subject or 'Steer'} on thread "
+                                f"{thread_id} was taken in elsewhere; not posting"
+                            )
+                            return "taken", None
                     if (
                         resp.status == 409
                         or resp.status >= 500

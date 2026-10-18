@@ -41,6 +41,9 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
     with patch(
         "src.server.database.workspace.get_workspaces_for_user",
         AsyncMock(return_value=([row], 1)),
+    ), patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value={"computer_id": "cmp-1"}),
     ):
         command = await tools.workspaces_list(OWNER, "call-1")
     content = command.update["messages"][0].content
@@ -62,7 +65,7 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
 async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
     """Home reads its siblings' folders on its own computer. A workspace on
     another computer has no folder there, so its row names none."""
-    from src.server.database.home_workspace import get_flash_workspace_id
+    from src.server.database.home_workspace import get_home_workspace_id
     from src.tools.secretary.chief_of_staff import chief_of_staff_workspaces
 
     rows = [
@@ -88,4 +91,4 @@ async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
         "ws-here": "semis",
         "ws-there": None,
     }
-    read_home.assert_awaited_once_with(get_flash_workspace_id(OWNER))
+    read_home.assert_awaited_once_with(get_home_workspace_id(OWNER))

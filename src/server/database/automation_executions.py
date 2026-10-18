@@ -8,7 +8,6 @@ from uuid import uuid4
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from src.server.contracts.status import INTERRUPT_REASON_CREDIT_PAUSE
 from src.server.database.automation import (
     EXECUTION_COLUMNS,
     UNSETTLED_STATUSES,
@@ -302,9 +301,10 @@ async def list_executions(
 
     Every row is scoped by its automation's owner, which is the ownership
     check: another user's automation lists nothing. ``workspace_id`` prefers
-    the run thread's workspace: a flash automation stores none and runs in
-    the user's shared flash workspace. One row past the page answers whether
-    another follows, where a count would read every run the user has.
+    the run thread's workspace, where the run happened, over the one the
+    automation names now, which a move may have changed since. One row past
+    the page answers whether another follows, where a count would read every
+    run the user has.
     """
     where_parts = ["a.user_id = %s"]
     params: list = [user_id]
@@ -323,7 +323,7 @@ async def list_executions(
             await cur.execute(f"""
                 SELECT
                     {EXECUTION_COLUMNS},
-                    a.name AS automation_name, a.agent_mode, a.trigger_type,
+                    a.name AS automation_name, a.trigger_type,
                     COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
@@ -497,25 +497,15 @@ async def list_abandoned_executions(
 
 
 async def get_settling_run(run_id: str) -> Optional[Dict[str, Any]]:
-    """The columns of a run's ledger row that settling its firing reads.
-
-    ``sse_events`` is the turn's whole event archive, which can run to
-    megabytes, so it is read only for a credit pause settled before its
-    finalize stamped the denial into ``metadata``: the pause's stored
-    interrupt is then the one place that still has it.
-    """
+    """The columns of a run's ledger row that settling its firing reads."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
                 SELECT conversation_response_id, status, interrupt_reason,
-                       metadata, errors,
-                       CASE WHEN interrupt_reason = %s
-                            AND NOT (COALESCE(metadata, '{}'::jsonb)
-                                     ? 'credit_pause_message')
-                       THEN sse_events END AS sse_events
+                       metadata, errors
                 FROM conversation_responses
                 WHERE conversation_response_id = %s
-            """, (INTERRUPT_REASON_CREDIT_PAUSE, run_id))
+            """, (run_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
 

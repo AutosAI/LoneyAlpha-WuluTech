@@ -34,7 +34,7 @@ from src.server.database.user import (
     update_user as db_update_user,
     upsert_user_preferences,
 )
-from src.server.services.llm.config import FLASH_FOLLOWS
+from src.server.services.llm.config import BACKGROUND_FOLLOWS
 from src.server.services.llm.thread_model import (
     DEFAULT_MODEL_KEYS,
     DEFAULT_MODEL_SCOPES,
@@ -477,6 +477,15 @@ _VALID_OUTPUT_FORMATS = {"markdown", "html"}
 # re-route a stale client's write; drop with the resolver's legacy read.
 LEGACY_MODEL_KEYS = frozenset(MOVED_MODEL_KEYS)
 
+#: The Background model's preference keys before their rename -> after. No
+#: reader looks under the old names, so a write to one is refused rather than
+#: stored, and the client that sent it learns to reload.
+RENAMED_MODEL_KEYS = {
+    "preferred_flash_model": "preferred_background_model",
+    "flash_follows": "background_follows",
+}
+
+
 def _tuning_400(exc: TuningError) -> HTTPException:
     """The 400 for a tuning value the stored shape does not allow.
 
@@ -579,12 +588,23 @@ def _clear_unhonored_efforts(
         patch[model] = {**(patch.get(model) or {}), "reasoning_effort": None}
 
 
+def _refuse_renamed_model_keys(*bags: dict | None) -> None:
+    """Refuse a key in ``RENAMED_MODEL_KEYS``, in either bag it was once read
+    from, naming the key that replaced it."""
+    for bag in bags:
+        for old, new in RENAMED_MODEL_KEYS.items():
+            if bag and old in bag:
+                raise HTTPException(
+                    status_code=400, detail=f"{old} was renamed to {new}"
+                )
+
+
 def _validate_default_model_choices(model_pref: dict) -> None:
-    """Refuse a ``default_model_scope`` or ``flash_follows`` no reader acts on.
-    None = key deletion."""
+    """Refuse a ``default_model_scope`` or ``background_follows`` no reader
+    acts on. None = key deletion."""
     for key, allowed in (
         ("default_model_scope", DEFAULT_MODEL_SCOPES),
-        ("flash_follows", FLASH_FOLLOWS),
+        ("background_follows", BACKGROUND_FOLLOWS),
     ):
         value = model_pref.get(key)
         if value is not None and (not isinstance(value, str) or value not in allowed):
@@ -641,6 +661,8 @@ async def update_preferences(
     other_pref = request.other_preference.model_dump(exclude_unset=True) if request.other_preference else None
     model_pref = request.model_preference.model_dump(exclude_unset=True) if request.model_preference else None
 
+    _refuse_renamed_model_keys(model_pref, other_pref)
+
     # The model keys live in their own column now. A client still
     # sending them under other_preference is honored for one release so an old
     # tab does not silently drop the user's settings on the floor.
@@ -684,7 +706,11 @@ async def update_preferences(
         other_pref.get("search_provider") is not None
         or other_pref.get("search_depth") is not None
     ):
-        from src.tools.web.manifest import CAPABILITY_SEARCH, providers_with_capability
+        from src.tools.web.manifest import (
+            CAPABILITY_SEARCH,
+            providers_with_capability,
+            search_levels,
+        )
 
         providers = providers_with_capability(CAPABILITY_SEARCH)
 
@@ -700,16 +726,7 @@ async def update_preferences(
             # Depth names are provider-scoped: validate against the provider
             # in this payload, or any provider when none is being set (the
             # effective provider isn't known at write time).
-            if isinstance(sp, str) and sp in providers:
-                valid_depths = {
-                    lv.name for lv in providers[sp].capability(CAPABILITY_SEARCH).levels
-                }
-            else:
-                valid_depths = {
-                    lv.name
-                    for spec in providers.values()
-                    for lv in spec.capability(CAPABILITY_SEARCH).levels
-                }
+            valid_depths = search_levels(sp)
             if not isinstance(sd, str) or sd not in valid_depths:
                 raise HTTPException(
                     status_code=400,

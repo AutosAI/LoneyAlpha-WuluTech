@@ -7,7 +7,6 @@ submodule directly.
 """
 
 from src.server.database.conversation._sql import (
-    _RESPONSE_COLUMNS,
     _SETTLED_ATTEMPTS,
     settled_attempts,
 )
@@ -43,7 +42,6 @@ from src.server.database.conversation.threads_write import (
     delete_thread,
     ensure_thread_exists,
     _EXISTS_TTL,
-    promote_flash_thread,
     stamp_thread_seen,
     thread_exists_key,
     truncate_thread_from_turn,
@@ -61,8 +59,6 @@ from src.server.database.conversation.queries import (
 )
 from src.server.database.conversation.responses import (
     get_recent_responses_for_thread,
-    get_responses_for_thread,
-    _sse_has_provenance,
     _sync_provenance_for_response,
 )
 from src.server.database.conversation.usage import (
@@ -100,7 +96,6 @@ __all__ = [
     "get_recent_responses_for_thread",
     "get_replay_responses",
     "get_replay_thread_data",
-    "get_responses_for_thread",
     "get_thread_auth_meta",
     "get_thread_by_id",
     "get_thread_by_share_token",
@@ -117,11 +112,8 @@ __all__ = [
     "_like_escape",
     "lookup_thread_by_external_id",
     "QueryConflictError",
-    "promote_flash_thread",
-    "_RESPONSE_COLUMNS",
     "_SETTLED_ATTEMPTS",
     "settled_attempts",
-    "_sse_has_provenance",
     "_sync_provenance_for_response",
     "thread_exists_key",
     "truncate_thread_from_turn",

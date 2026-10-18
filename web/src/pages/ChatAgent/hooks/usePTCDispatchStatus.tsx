@@ -31,10 +31,10 @@ const TERMINAL: ReadonlySet<PTCDispatchStatus> = new Set(['completed', 'failed',
 // 'running' within seconds, so this only trips on a stuck dispatch, or on a read
 // that keeps failing before it ever saw the run.
 const STARTING_POLL_CAP = 30;
-// The batched liveness read is cheap, but a flash turn can register several
-// dispatched runs at once, so stay responsive for the first few polls (quick
-// completion / HITL prompt) then back off — a dispatched analysis runs for
-// minutes.
+// The batched liveness read is cheap, but a Chief of Staff turn can register
+// several dispatched runs at once, so stay responsive for the first few polls
+// (quick completion / HITL prompt) then back off: a dispatched analysis runs
+// for minutes.
 const POLL_FAST_MS = 4_000;
 const POLL_STEADY_MS = 10_000;
 const POLL_FAST_COUNT = 5;
@@ -95,6 +95,10 @@ interface DispatchSlice {
   status: PTCDispatchStatus;
   /** Start of the live run (epoch ms), when the ledger has one. */
   startedAt?: number;
+  /** The thread's title, once it is named. */
+  title?: string;
+  /** The current name of the thread's workspace. */
+  workspaceName?: string;
 }
 
 interface DispatchStatusContextValue {
@@ -107,7 +111,7 @@ interface DispatchStatusContextValue {
 const DispatchStatusContext = createContext<DispatchStatusContextValue | null>(null);
 
 /**
- * Runs ONE batched dispatch-liveness query for every PTC card in a flash turn.
+ * Runs ONE batched dispatch-liveness query for every PTC card in a Chief of Staff turn.
  * Cards register/unregister their thread id; the provider polls the sorted id
  * set once and distributes a per-id status slice via context — collapsing N
  * per-card `/status` polls into a single request on a single timer.
@@ -205,6 +209,8 @@ export function DispatchStatusProvider({ children }: { children: ReactNode }) {
       slices.set(row.thread_id, {
         status: mapLivenessStatus(row.status),
         startedAt: Number.isFinite(startedAt) ? startedAt : undefined,
+        title: row.title?.trim() || undefined,
+        workspaceName: row.workspace_name?.trim() || undefined,
       });
     }
     return slices;
@@ -247,12 +253,13 @@ export function mapLifecycleStatus(s: PublicRunStatus): PTCDispatchStatus | null
  * pre-ledger fallback: a just-dispatched run has no lifecycle row yet, and
  * only the poll can distinguish "still registering" from "never registered".
  * Registers the id while `enabled` so the provider's batched query covers it;
- * returns 'starting' when neither source has resolved the id yet.
+ * returns 'starting' when neither source has resolved the id yet. The thread's
+ * title and its workspace's current name come from the poll alone.
  */
 export function useDispatchStatus(
   threadId: string | undefined,
   enabled: boolean,
-): { status: PTCDispatchStatus; startedAt?: number } {
+): { status: PTCDispatchStatus; startedAt?: number; title?: string; workspaceName?: string } {
   const ctx = useContext(DispatchStatusContext);
   // Pull the stable register fns out of the context value (whose identity
   // changes every poll) so this effect doesn't re-run — and re-register — on
@@ -269,5 +276,10 @@ export function useDispatchStatus(
 
   const pushed = mapLifecycleStatus(useThreadRunStatus(threadId ?? ''));
   const slice = ctx && threadId ? ctx.slices.get(threadId) : undefined;
-  return { status: pushed ?? slice?.status ?? 'starting', startedAt: slice?.startedAt };
+  return {
+    status: pushed ?? slice?.status ?? 'starting',
+    startedAt: slice?.startedAt,
+    title: slice?.title,
+    workspaceName: slice?.workspaceName,
+  };
 }

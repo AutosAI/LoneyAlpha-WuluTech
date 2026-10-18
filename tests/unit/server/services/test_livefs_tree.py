@@ -29,10 +29,12 @@ from langgraph.store.memory import InMemoryStore
 
 from ptc_agent.agent.backends import db_json_route
 from ptc_agent.agent.backends.automations import AutomationsBackend
+from ptc_agent.agent.backends.subagents import SubagentsBackend
 from ptc_agent.agent.backends.db_json_route import Plan
 from ptc_agent.core.sandbox.livefs_mount import CallContext
 from ptc_agent.core.sandbox.livefs_runtime.protocol import INLINE_MAX_BYTES
 from src.server.database import workspace as workspace_db
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.thread_transcripts import ListedFile, StoredFile
 from src.server.database.workspace_folders import MOVING_DIR
 from src.server.services.automations.file import (
@@ -86,7 +88,7 @@ SERVED = '{"name": "Morning brief", "status": "active"}\n'
 EDITED = '{"name": "Morning brief", "status": "paused"}\n'
 ROWS_VERSION = "sha256:rows-v1"
 REPORT = 'Saved morning-brief.json: updated "Morning brief": paused'
-DOCUMENT = Document(fields={}, shown=None, timezone="UTC", model_pref=None)
+DOCUMENT = Document(fields={}, shown=None, timezone="UTC", model_pref=None, home_id=get_home_workspace_id(USER))
 
 
 def _sha(data: bytes) -> str:
@@ -272,7 +274,7 @@ async def test_the_root_holds_user_workflows_workspaces_and_computer(tree):
 @pytest.mark.asyncio
 async def test_user_holds_the_automations_folder_which_takes_new_files(tree, automations):
     entries = (await tree.list("user")).entries
-    assert [e["name"] for e in entries] == ["memory", "memo", "profile", "automations"]
+    assert [e["name"] for e in entries] == ["memory", "memo", "profile", "automations", "agents"]
 
     listing = await tree.list("user/automations")
     assert [(e["name"], e["writable"]) for e in listing.entries] == [
@@ -482,6 +484,7 @@ async def test_every_file_lists_the_size_version_and_content_its_read_returns(
 
     for filename in list(UserDataBackend.files):
         monkeypatch.setitem(UserDataBackend.files, filename, profile(filename))
+    monkeypatch.setattr(SubagentsBackend, "rendered", classmethod(AsyncMock(return_value={})))
     sizes = _SizeCache()
     monkeypatch.setattr(
         livefs_cache, "get_cache_client", lambda: SimpleNamespace(enabled=True, client=sizes)
@@ -505,6 +508,7 @@ async def test_every_file_lists_the_size_version_and_content_its_read_returns(
             *(f"user/profile/{name}" for name in (*UserDataBackend.data_files, "README.md")),
             "user/automations/README.md",
             AUTOMATIONS,
+            "user/agents/README.md",
             "workflows/daily.js",
             f"workspaces/{HERE}/memory/plan.md",
             *(transcripts + name for name in TRANSCRIPT),
@@ -1019,7 +1023,7 @@ async def test_a_move_within_the_folder_renames_the_file_and_keeps_the_automatio
         f"{ROOT}/.agents/user/automations/brief.json",
         "Renamed morning-brief.json to brief.json",
     )
-    automations.rename.assert_awaited_once_with(USER, "brief.json", ANY)
+    automations.rename.assert_awaited_once_with(USER, "brief.json", ANY, ANY)
     automations.others["brief.json"].commit.assert_not_awaited()
 
 

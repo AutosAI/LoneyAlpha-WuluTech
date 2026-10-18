@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
 from ptc_agent.agent.middleware.order_governance import RECEIPT_KEY
-from src.tools.secretary import SECRETARY_TOOLS
 from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 from src.utils.nested import without_keys
 
@@ -47,13 +46,18 @@ _OWNER_ID_KEYS = frozenset({"workspace_id", "user_id"})
 # The one mark a direct MCP call carries before its answer: ``direct_tool_name``
 # builds every direct tool name under this prefix, its digest forms included.
 _DIRECT_TOOL_PREFIX = "mcp__"
-# The account tools of the flash agent and the Chief of Staff list, create,
-# delete and dispatch into the owner's workspaces and threads. Their answers
-# are the owner's own rows as text, sandbox and user ids included, which no key
-# strip reaches, and their arguments name the same things. A share renders none
-# of these calls, so each travels as its name and id alone.
-_SECRETARY_TOOL_NAMES = frozenset(
-    t.name for t in (*SECRETARY_TOOLS, *CHIEF_OF_STAFF_TOOLS)
+# The Chief of Staff's account tools list, create, delete and dispatch into the
+# owner's workspaces and threads. Their answers are the owner's own rows as
+# text, sandbox and user ids included, which no key strip reaches, and their
+# arguments name the same things. A share renders none of these calls, so each
+# travels as its name and id alone. The retired Flash agent's did the same
+# under these names, and threads it ran are still shared, so they stay spelled
+# out here.
+_EARLIER_SECRETARY_TOOL_NAMES = frozenset(
+    {"manage_workspaces", "ptc_agent", "agent_output", "manage_threads"}
+)
+_SECRETARY_TOOL_NAMES = _EARLIER_SECRETARY_TOOL_NAMES | frozenset(
+    t.name for t in CHIEF_OF_STAFF_TOOLS
 )
 # The retired user data tools answered with raw rows until they dropped the
 # owner's user_id, and threads stored before then still spell it out in the
@@ -164,16 +168,16 @@ def _without_user_id_pairs(text: str) -> str:
 
 
 class ShareRedaction:
-    """One shared thread's queries and stored events as a viewer may read them.
+    """One shared thread's queries and replayed events as a viewer may read them.
 
-    Built from every stored event of the thread, then fed the events in stream
-    order, since a call's name is known only once its ``tool_calls`` event has
-    passed. One instance serves one replay.
+    Built from every event of the thread's replay, then fed the events in
+    stream order, since a call's name is known only once its ``tool_calls``
+    event has passed. One instance serves one replay.
     """
 
-    def __init__(self, stored_events: list[dict[str, Any]]) -> None:
-        self._order_calls = _order_call_ids(stored_events)
-        self._cleared_calls = _cleared_call_ids(stored_events)
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._order_calls = _order_call_ids(events)
+        self._cleared_calls = _cleared_call_ids(events)
         # The latest name each call id was made under, None once a result has
         # answered it. A result names only its call id, which a provider may
         # repeat later, so this follows the stream rather than reading the
@@ -208,16 +212,17 @@ class ShareRedaction:
         """
         if event_type in _DROPPED_EVENTS:
             return None
-        # Stored workspace_status events carry the workspace id at the top
-        # level, tool artifacts (chart annotations) nest it, and a steering
-        # event names the user on each message, so the owner's ids go at every
-        # depth. sandbox_state is server-side runtime state.
+        # An archived workspace_status event a legacy turn replays verbatim
+        # carries the workspace id at the top level, tool artifacts (chart
+        # annotations) nest it, and a steering event names the user on each
+        # message, so the owner's ids go at every depth. sandbox_state is
+        # server-side runtime state.
         data = without_keys(data, _OWNER_ID_KEYS)
+        data.pop("sandbox_state", None)
         if event_type == "steering_delivered":
             # A report a live turn took in names its source as a report
             # turn's query metadata does; a share keeps neither.
             data = without_keys(data, {"report_source"})
-        data.pop("sandbox_state", None)
         if event_type in _ERROR_TEXT_EVENTS:
             data.pop("error", None)
         if event_type == "tool_calls":

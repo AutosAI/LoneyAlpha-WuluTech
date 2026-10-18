@@ -42,7 +42,7 @@ export const queryKeys = {
     list:   (params: Record<string, unknown>) => [...queryKeys.workspaces.lists(), params],
     details: () => [...queryKeys.workspaces.all, 'detail'],
     detail: (id: string) => [...queryKeys.workspaces.details(), id],
-    flash:  () => [...queryKeys.workspaces.all, 'flash'],
+    home:   () => [...queryKeys.workspaces.all, 'home'],
     quota:  () => [...queryKeys.workspaces.all, 'quota'],
   },
   // The signed prefix the owner's report iframes load under, one per workspace
@@ -184,13 +184,12 @@ export const queryKeys = {
     // (workspace-effective view), or 'all-scopes' (the Plugins inventory) —
     // allScopes and workspaceId are mutually exclusive on the wire.
     list: (
-      mode: string | null,
       includeDisabled = false,
       workspaceId: string | null = null,
       allScopes = false,
     ) =>
       [
-        ...queryKeys.skills.all, 'list', mode ?? 'all', includeDisabled,
+        ...queryKeys.skills.all, 'list', includeDisabled,
         allScopes ? 'all-scopes' : (workspaceId ?? 'user'),
       ],
     // One file of a skill, SKILL.md by default (the detail view).
@@ -199,6 +198,12 @@ export const queryKeys = {
     // The server's upload caps; deployment configuration, so they hold for
     // the life of the page.
     limits: () => [...queryKeys.skills.all, 'limits'],
+  },
+  // One read carries every subagent plus what the pane needs to edit them
+  // (connector names, brokerage flags, limits), so a write lands in one entry.
+  subagents: {
+    all:  ['subagents'],
+    list: () => [...queryKeys.subagents.all, 'list'],
   },
   userVault: {
     all:        ['userVault'],

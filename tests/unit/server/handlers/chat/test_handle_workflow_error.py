@@ -103,8 +103,6 @@ async def test_max_retries_branch_finalizes_error(coordinator):
             start_time=0.0,
             request=_make_request(),
             is_byok=False,
-            msg_type="user",
-            log_prefix="CHAT",
         ))
 
     coordinator.finalize_run.assert_awaited_once()
@@ -134,14 +132,14 @@ async def test_non_recoverable_branch_finalizes_error(coordinator):
             start_time=0.0,
             request=_make_request(),
             is_byok=False,
-            msg_type="user",
-            log_prefix="CHAT",
         ))
 
     coordinator.finalize_run.assert_awaited_once()
     _, outcome = coordinator.finalize_run.await_args.args
     assert outcome.status == "error"
     assert outcome.errors == ["'NoneType' has no attribute 'foo'"]
+    # The run row keeps START's producer stamp; the merge must not touch it.
+    assert "msg_type" not in outcome.metadata
 
 
 @pytest.mark.asyncio
@@ -166,8 +164,6 @@ async def test_finalize_failure_does_not_break_error_flow(coordinator):
             start_time=0.0,
             request=_make_request(),
             is_byok=False,
-            msg_type="user",
-            log_prefix="CHAT",
         ))
 
     assert any(ev.startswith("event: error\n") for ev in events)
@@ -200,8 +196,6 @@ async def test_external_id_conflict_branch_emits_conflict_and_skips_finalize(
             start_time=0.0,
             request=_make_request(),
             is_byok=False,
-            msg_type="user",
-            log_prefix="CHAT",
         ))
 
     assert len(events) == 1
@@ -243,8 +237,6 @@ async def test_query_conflict_branch_emits_turn_conflict_and_skips_finalize(
             start_time=0.0,
             request=_make_request(),
             is_byok=False,
-            msg_type="user",
-            log_prefix="CHAT",
         ))
 
     assert len(events) == 1
@@ -282,8 +274,6 @@ async def test_a_fork_whose_branch_moved_is_refused_as_the_route_refuses_it(
                 start_time=0.0,
                 request=_make_request(),
                 is_byok=False,
-                msg_type="ptc",
-                log_prefix="CHAT",
             )
         )
 
@@ -323,8 +313,6 @@ async def _fail(err, *, scope, request):
             start_time=0.0,
             request=request,
             is_byok=False,
-            msg_type="ptc",
-            log_prefix="CHAT",
         )))
 
 
@@ -509,24 +497,27 @@ async def test_a_refused_retransmit_reconnects_to_its_first_copy(
 
 @pytest.mark.asyncio
 async def test_a_refused_resend_of_a_steered_send_reconnects_to_its_turn(
-    coordinator, monkeypatch
+    coordinator,
 ):
     # The first copy went into the running turn as a steer: no run row holds
-    # its key, the steer record names the turn that took it.
+    # its key, the steer job names the turn that took it.
     from fastapi import HTTPException
 
     from src.server.handlers.chat.admission_gate import admission_conflict_detail
-    from src.server.handlers.chat.steering import steer_thread
 
-    from .redis_fakes import FakeCache
-
-    cache = FakeCache()
-    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: cache)
     request = _keyed_send()
-    await steer_thread(
-        "t-1", "what moved NVDA?", "u-1", run_id="r-first", request_key=request.request_key
-    )
+    job = {
+        "id": "job-1",
+        "status": "pending",
+        "run_id": "r-first",
+        "payload": {"request_key": request.request_key, "steered_run_id": "r-first"},
+    }
     with (
+        patch(
+            "src.server.database.runs.outbox.get_steer_job",
+            AsyncMock(return_value=job),
+            create=True,
+        ),
         patch(_FIND_KEY, AsyncMock(return_value=None)),
         patch(
             "src.server.database.runs.lifecycle.get_run",

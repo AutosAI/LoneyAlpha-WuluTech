@@ -44,6 +44,7 @@ const HREF = `${window.location.origin}/a/${CODE}`;
 function link(overrides: Partial<FileShareLink> = {}): FileShareLink {
   return {
     code: CODE,
+    workspace_id: WS,
     url: `/a/${CODE}`,
     kind: 'file',
     path: ENTRY,
@@ -337,7 +338,7 @@ describe('ShareLinkDialog', () => {
 
     it('a link that fails to load offers a retry instead of a spinner', async () => {
       mockCreate
-        .mockRejectedValueOnce(apiError(400, 'Flash workspaces do not have shareable files'))
+        .mockRejectedValueOnce(apiError(400, 'Home is not on a computer yet'))
         .mockResolvedValue(link());
       mockFiles.mockResolvedValue(files([ENTRY_ROW]));
       const user = userEvent.setup();

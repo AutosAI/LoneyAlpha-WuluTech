@@ -265,14 +265,14 @@ class ChatMessage(BaseModel):
 class ThreadOrigin(BaseModel):
     """Who initiated a thread — stored under the thread's metadata['origin'].
 
-    'agent' = spawned by another agent (id = dispatching flash thread id),
+    'agent' = spawned by another agent (id = the dispatching thread's id),
     'automation' = scheduled/triggered run (id = automation id), 'system' =
     set aside for platform-initiated threads. The label is advisory —
     client-supplied, not authenticated, and nothing branches on it.
     User-initiated threads carry no origin at all rather than an explicit
-    'user' entry. ``name`` and ``agent`` are display only (the history label
-    above a message) and never reach the model's context, which reads
-    ``type`` alone.
+    'user' entry. ``name`` is display only (the history label above a
+    message). ``agent`` labels it too, and the turn's run line names it as
+    acting for the user; the rest of the model's context reads ``type`` alone.
     """
 
     type: Literal["agent", "automation", "system"]
@@ -280,7 +280,7 @@ class ThreadOrigin(BaseModel):
     # automation: the automation's name at send time, capped as automations cap it
     name: Optional[str] = Field(default=None, max_length=255)
     # agent: which agent dispatched the thread
-    agent: Optional[Literal["chief_of_staff", "flash"]] = None
+    agent: Optional[Literal["chief_of_staff"]] = None
 
 
 class AnalystReport(BaseModel):
@@ -313,17 +313,12 @@ ReportSource = Annotated[AnalystReport | TaskReport, Field(discriminator="kind")
 class ChatRequest(BaseModel):
     """Request model for streaming chat endpoint."""
 
-    # Agent mode selection
-    agent_mode: Optional[Literal["ptc", "flash"]] = Field(
-        default=None,
-        description="Agent mode: 'ptc' (default) for sandbox-based execution, "
-        "'flash' for lightweight, fast responses without sandbox",
-    )
-
     # Identity fields (user_id comes from Bearer token JWT sub claim)
     workspace_id: Optional[str] = Field(
         default=None,
-        description="Workspace identifier - required for 'full' mode, optional for 'flash' mode",
+        description="Workspace the turn runs in; Home's id (POST /workspaces/home) "
+        "runs it in the user's Home. Required on a new thread; a follow-up "
+        "turn defaults to its thread's.",
     )
 
     # Messages
@@ -474,23 +469,23 @@ class ChatRequest(BaseModel):
         description="Override query_type for this request. Internal use only.",
     )
 
-    # Internal: PTC thread id whose report-back this flash run consumes. When a
-    # flash report-back run (dispatched after PTC completion) finishes, its
-    # completion hook clears the durable flash_watch entry for this PTC thread.
+    # Internal: PTC thread id whose report-back this run consumes. When a
+    # report-back run (dispatched after PTC completion) finishes, its
+    # completion hook clears the durable watch-set entry for this PTC thread.
     report_back_ptc_thread_id: Optional[str] = Field(
         default=None,
-        description="PTC thread id this flash report-back run consumes. "
+        description="PTC thread id this report-back run consumes. "
         "Internal use only.",
     )
 
-    # Internal: the flash thread watching this dispatched PTC run. Stamped
+    # Internal: the thread watching this dispatched PTC run, in Home. Stamped
     # into the run's START metadata so finalize can build report-back hook
-    # ordering keys (all completions reporting into one flash thread
+    # ordering keys (all completions reporting into one Chief of Staff thread
     # serialize) without I/O. An ordering hint only — executors re-resolve
     # the authoritative origin from Redis at execution time.
-    origin_flash_thread_id: Optional[str] = Field(
+    origin_home_thread_id: Optional[str] = Field(
         default=None,
-        description="Flash thread watching this dispatched PTC run. "
+        description="Thread watching this dispatched PTC run. "
         "Internal use only.",
     )
 
@@ -537,6 +532,14 @@ class ChatRequest(BaseModel):
         default=None,
         description="Build this turn's agent without subagent tools. "
         "Internal use only.",
+    )
+
+    # Internal: the parked steer this turn is posted for. START claims the
+    # job in its own transaction, so a steer some running turn already read
+    # never also becomes a turn of its own.
+    steer_job_id: Optional[str] = Field(
+        default=None,
+        description="The steer job this turn carries. Internal use only.",
     )
 
     # Server-stamped: the burst-guard ZSET member held by this request's

@@ -50,7 +50,7 @@ def _app():
 
 
 @contextmanager
-def _send_stubs(*, owner_id, stored_model=None, turn_model=None, msg_type="ptc"):
+def _send_stubs(*, owner_id, stored_model=None, turn_model=None):
     """Everything past the route stubbed; yields the mocks a test asserts on.
 
     ``turn_model`` is what ``thread_model.turn_model`` answers.
@@ -63,7 +63,7 @@ def _send_stubs(*, owner_id, stored_model=None, turn_model=None, msg_type="ptc")
         {
             "user_id": owner_id,
             "is_shared": False,
-            "msg_type": msg_type,
+            "msg_type": "ptc",
             "workspace_id": "ws-placeholder",
             "llm_model": stored_model,
         }
@@ -82,7 +82,13 @@ def _send_stubs(*, owner_id, stored_model=None, turn_model=None, msg_type="ptc")
         patch(f"{THREAD_MODEL_MOD}.turn_model", new=mocks["turn_model"]),
         patch(
             "src.server.database.workspace.get_workspace",
-            new=AsyncMock(return_value={"user_id": USER, "status": "running"}),
+            new=AsyncMock(
+                return_value={
+                    "workspace_id": "ws-placeholder",
+                    "user_id": USER,
+                    "status": "running",
+                }
+            ),
         ),
         patch.object(setup_module, "agent_config", MagicMock()),
         patch("src.server.services.llm.config.resolve_llm_config", new=mocks["resolve"]),
@@ -107,7 +113,6 @@ async def _send(
 ):
     body = {
         "messages": [{"role": "user", "content": "test query"}],
-        "agent_mode": "ptc",
     }
     if workspace_id is not None:
         body["workspace_id"] = workspace_id
@@ -136,20 +141,6 @@ async def test_a_turn_naming_no_model_runs_the_threads_own():
 
 
 @pytest.mark.asyncio
-async def test_a_flash_thread_the_full_agent_takes_over_passes_over_flashs_model():
-    """Its promotion forgets the model only once the turn runs, so the first
-    turn already runs the full agent's default."""
-    with _send_stubs(
-        owner_id=USER, stored_model="m-flash", turn_model=None, msg_type="flash"
-    ) as m:
-        resp = await _send()
-
-    assert resp.status_code == 200
-    m["turn_model"].assert_awaited_once_with(USER, "tid-mine", named=None, held=None)
-    assert _resolved_model(m["resolve"]) is None
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("admitted", [True, False], ids=["admitted", "refused"])
 async def test_home_is_bound_only_once_the_admission_gates_pass(admitted):
     from fastapi import HTTPException
@@ -159,18 +150,17 @@ async def test_home_is_bound_only_once_the_admission_gates_pass(admitted):
     credit = AsyncMock(
         side_effect=None if admitted else HTTPException(status_code=402, detail="quota")
     )
-    route = AsyncMock(return_value=TurnRoute("ptc", "home-ws", role="chief_of_staff"))
+    route = MagicMock(return_value=TurnRoute("home-ws", "chief_of_staff"))
     bind = AsyncMock(return_value="home-ws")
     with (
         _send_stubs(owner_id=USER),
         patch("src.server.dependencies.usage_limits.enforce_credit_limit", new=credit),
-        patch("src.server.services.turn_runtime.resolve_turn_route", new=route),
+        patch("src.server.services.turn_runtime.turn_route", new=route),
         patch("src.server.services.turn_runtime.ensure_home", new=bind),
     ):
         resp = await _send()
 
     assert resp.status_code == (200 if admitted else 402)
-    assert route.await_args.kwargs == {"bind_home": False}
     assert bind.await_count == (1 if admitted else 0)
 
 

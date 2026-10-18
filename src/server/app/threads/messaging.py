@@ -1,7 +1,7 @@
 """Thread messaging: send/stream SSE, reconnect/replay, control, retry, mux."""
 
 import json
-from typing import Optional
+from typing import Literal, Optional
 from uuid import uuid4
 
 import asyncio
@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from src.server.utils import api as auth_api
 from src.server.utils.api import (
     CurrentUserId,
+    database_unavailable,
     service_token_matches,
 )
 from src.server.models.chat import ChatRequest
@@ -26,7 +27,8 @@ from src.server.database.conversation import (
     lookup_thread_by_external_id,
     get_replay_thread_data,
 )
-from psycopg_pool import PoolTimeout
+from src.server.database.pool import DATABASE_UNAVAILABLE
+from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
 from src.server.dependencies.usage_limits import ChatRateLimited
 
 from src.observability import (
@@ -156,7 +158,7 @@ async def _consume_background_gen(
             # This generator was already primed past START (2.4c) — the run
             # row exists, so the coordinator's reconcile (here, or the real
             # owner's finalize) enqueues the durable watch_clear on the
-            # flash ordering chain, which owns any pair teardown. No direct
+            # report-back ordering chain, which owns any pair teardown. No direct
             # report-back clear here: it would run OFF-CHAIN against a live
             # admission (round-19 P1).
             from src.server.services.runs.coordinator import RunCoordinator
@@ -225,19 +227,21 @@ def _is_service_request(raw_request: Request | None) -> bool:
 
 
 # Fields only the server's own requests set. A user's copy would post a system
-# message, label their message as a report-back, or forge a report-back watch's
-# cleanup; ``surface_rules`` is a channel gateway's, whose text rides the
-# operator role on providers with a native channel.
+# message, label their message as a report-back, forge a report-back watch's
+# cleanup, or settle a parked steer as its own turn; ``surface_rules`` is a
+# channel gateway's, whose text rides the operator role on providers with a
+# native channel.
 _SERVER_ONLY_FIELDS = (
     "query_type",
     "report_back_ptc_thread_id",
     "report_source",
-    "origin_flash_thread_id",
+    ORIGIN_THREAD_META,
     "origin_dispatch_gen",
     "automation_delivery",
     "automation_earlier_runs",
     "disable_subagents",
     "surface_rules",
+    "steer_job_id",
 )
 
 
@@ -255,7 +259,11 @@ def _client_body(request: ChatRequest, raw_request: Request) -> ChatRequest:
 
 
 async def _reject_duplicate_request(
-    thread_id: str, request_key: str, user_id: str
+    thread_id: str,
+    request_key: str,
+    user_id: str,
+    *,
+    except_job_id: str | None = None,
 ) -> None:
     """409 if this request_key already reached a run, as its own turn or as
     a steer into another: a retransmit.
@@ -264,11 +272,14 @@ async def _reject_duplicate_request(
     classifying here answers with a clean HTTP 409 before a thread is
     minted, a fork truncates the rows holding the key, or a steering path
     consumes the duplicate. Discloses the existing run's identity only to
-    the owning user.
+    the owning user. ``except_job_id`` is the parked steer a server-posted
+    turn carries, which is that turn's own message, not a copy of it.
     """
     from src.server.services.runs.admission import run_named_by_key
 
-    keyed = await run_named_by_key(thread_id, request_key)
+    keyed = await run_named_by_key(
+        thread_id, request_key, except_job_id=except_job_id
+    )
     if keyed is None:
         return
     existing = keyed.run
@@ -317,7 +328,12 @@ async def _settle_against_branch(
         return request
     except HTTPException as refused:
         if refused.status_code == 409 and request.request_key:
-            await _reject_duplicate_request(thread_id, request.request_key, user_id)
+            await _reject_duplicate_request(
+                thread_id,
+                request.request_key,
+                user_id,
+                except_job_id=request.steer_job_id,
+            )
         raise
 
 
@@ -336,16 +352,9 @@ async def _handle_send_message(
     /retry route passes it. Whatever the public body carried is overwritten
     — a forged value could chain a new attempt onto an arbitrary failed run.
     """
-    from src.server.handlers.chat import (
-        astream_flash_workflow,
-        astream_ptc_workflow,
-    )
+    from src.server.handlers.chat import astream_ptc_workflow
     from src.server.handlers.chat.error_handling import end_after_failure_frame
-    from src.server.services.turn_runtime import (
-        ensure_home,
-        requested_workspace,
-        resolve_turn_route,
-    )
+    from src.server.services.turn_runtime import requested_workspace, turn_route
 
     # Canonical run_id generation site. Each POST gets a fresh UUID that
     # flows through every downstream key: BTM ``(tid, rid)``, persistence
@@ -357,7 +366,6 @@ async def _handle_send_message(
 
     user_id = auth.user_id
     is_byok = auth.is_byok
-    agent_mode = request.agent_mode or "ptc"
     workspace_id = request.workspace_id
 
     from src.server.services.runs.admission import RunScope
@@ -385,7 +393,12 @@ async def _handle_send_message(
         # retransmit — classify it before any durable work happens for
         # this copy (thread creation, fork truncation, steering).
         if request.request_key:
-            await _reject_duplicate_request(thread_id, request.request_key, user_id)
+            await _reject_duplicate_request(
+                thread_id,
+                request.request_key,
+                user_id,
+                except_job_id=request.steer_job_id,
+            )
 
         # 403 guard: require BYOK, OAuth, or platform access (tier >= 0).
         # All flags are pre-checked by enforce_chat_limit — no DB calls here.
@@ -405,16 +418,15 @@ async def _handle_send_message(
         # request that will 403 anyway shouldn't do that work first. In oss mode
         # with no INTERNAL_SERVICE_TOKEN configured there is nothing to
         # authenticate against, so the self-dispatch is trusted; a configured
-        # token is enforced in every mode. This single is_internal value is
-        # reused by both dispatch branches below.
+        # token is enforced in every mode. Past this check a dispatch is
+        # always the server's own, so ``is_dispatch`` alone says so below.
         _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
         _svc_token = _get_service_token()
         is_internal = _is_service_request(raw_request)
-        if (
-            not is_internal
-            and raw_request
-            and raw_request.headers.get("X-Dispatch") == "background"
-        ):
+        is_dispatch = bool(
+            raw_request and raw_request.headers.get("X-Dispatch") == "background"
+        )
+        if is_dispatch and not is_internal:
             raise HTTPException(
                 status_code=403,
                 detail=(
@@ -454,16 +466,12 @@ async def _handle_send_message(
                 detail="PTC Agent not initialized. Check server startup logs.",
             )
 
-        # A flash request, or any turn in the flash workspace (a HITL resume
-        # whose client didn't resend agent_mode='flash'), runs on Flash, or in
-        # Home when the user has the all-workspaces agent. The workspace guard
-        # comes first: it pairs with the thread guard above. Home is bound once
-        # the admission gates below pass.
-        workspace = await requested_workspace(user_id, agent_mode, workspace_id)
-        route = await resolve_turn_route(
-            user_id, agent_mode, workspace_id, workspace, bind_home=False
-        )
-        runtime, workspace_id = route.agent, route.workspace_id
+        # A turn naming Home's id, or any turn on a thread in Home, runs in
+        # Home. The workspace guard comes first: it pairs with the thread
+        # guard above. Home is bound once the admission gates below pass.
+        workspace = await requested_workspace(user_id, workspace_id)
+        route = turn_route(user_id, workspace)
+        workspace_id = route.workspace_id
 
         # Extract user input
         user_input = ""
@@ -478,9 +486,9 @@ async def _handle_send_message(
                         break
 
         logger.info(
-            f"[{'FLASH' if runtime == 'flash' else 'PTC'}_CHAT] New request: "
+            f"[PTC_CHAT] New request: "
             f"workspace_id={workspace_id} thread_id={thread_id} user_id={user_id} "
-            f"mode={agent_mode} runtime={runtime}"
+            f"role={route.role}"
         )
 
         # Resolve LLM config eagerly — credit check must happen before SSE stream starts
@@ -494,12 +502,6 @@ async def _handle_send_message(
         # turns, which never pass through this route, keep their own model.
         requested_model = request.llm_model or None
         held_model = thread_meta.get("llm_model") if thread_meta else None
-        # A Flash thread the full agent takes over holds a model picked for
-        # Flash's slot. Its promotion forgets it, but only once the turn runs,
-        # so this first turn passes it over too.
-        taken_over = (
-            runtime == "ptc" and bool(thread_meta) and thread_meta.get("msg_type") == "flash"
-        )
         named_model = (
             thread_model.NamedModel(requested_model, seen=held_model)
             if requested_model
@@ -512,28 +514,24 @@ async def _handle_send_message(
                 user_id,
                 model,
                 is_byok,
-                mode=runtime,
                 reasoning_effort=getattr(request, "reasoning_effort", None),
                 fast_mode=getattr(request, "fast_mode", None),
                 thread_id=thread_id,
                 enabled_subagents=request.subagents_enabled,
                 workspace_id=workspace_id,
+                role=route.role,
             )
 
         # A report-back or a channel message has nobody at a client to
         # reconnect an account, and a refusal would drop it. A person's send
         # names no model while its client has not read the thread yet, and
         # gets the refusal rather than an answer from a model it never chose.
-        from_service = service_token_matches(_req_token, _svc_token) or bool(
-            is_internal
-            and raw_request
-            and raw_request.headers.get("X-Dispatch") == "background"
-        )
+        from_service = service_token_matches(_req_token, _svc_token) or is_dispatch
         config = await thread_model.resolve_turn_config(
             user_id,
             thread_id,
             named=requested_model,
-            held=None if taken_over else held_model,
+            held=held_model,
             fall_back=from_service,
             resolve=resolve,
         )
@@ -553,16 +551,14 @@ async def _handle_send_message(
         # failed(transport_lost) anyway — refuse cheaply instead.
         await _assert_stream_transport_ready()
 
-        if route.role == "chief_of_staff":
-            await ensure_home(user_id, workspace)
+        await route.bind(user_id, workspace)
 
     except BaseException:
         await scope.release_slot()
         raise
 
     # Resolve model name for observability labels (bounded by models.json keys).
-    _llm = getattr(config, "llm", None)
-    _model = (getattr(_llm, "flash", None) if runtime == "flash" else getattr(_llm, "name", None)) or ""
+    _model = getattr(getattr(config, "llm", None), "name", None) or ""
 
     # Content-Location header advertises the reconnect URL for this run.
     # Mirrors langgraph_sdk's protocol so reconnects target the exact run.
@@ -571,57 +567,35 @@ async def _handle_send_message(
         "Content-Location": f"/api/v1/threads/{thread_id}/messages/stream?run_id={run_id}",
     }
 
-    is_dispatch = bool(
-        is_internal
-        and raw_request
-        and raw_request.headers.get("X-Dispatch") == "background"
+    gen = astream_ptc_workflow(
+        request=request,
+        thread_id=thread_id,
+        run_id=run_id,
+        user_input=user_input,
+        user_id=user_id,
+        route=route,
+        is_byok=is_byok,
+        config=config,
+        dispatched=is_dispatch,
+        named_model=named_model,
+        # A report-back summary owes its pair's watch clear, so its finalize
+        # must see the pair.
+        run_metadata=(
+            {
+                "report_back_ptc_thread_id": request.report_back_ptc_thread_id,
+                "origin_dispatch_gen": request.origin_dispatch_gen,
+            }
+            if request.report_back_ptc_thread_id
+            else None
+        ),
+        extra_configurable=_automation_configurable(request),
     )
-    # Route to appropriate streaming function based on the runtime
-    if runtime == "flash":
-        gen = astream_flash_workflow(
-            request=request,
-            thread_id=thread_id,
-            run_id=run_id,
-            user_input=user_input,
-            user_id=user_id,
-            is_byok=is_byok,
-            config=config,
-            dispatched=is_dispatch,
-            flash_workspace=route.flash_workspace,
-            named_model=named_model,
-        )
-    else:
-        gen = astream_ptc_workflow(
-            request=request,
-            thread_id=thread_id,
-            run_id=run_id,
-            user_input=user_input,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            role=route.role,
-            is_byok=is_byok,
-            config=config,
-            dispatched=is_dispatch,
-            named_model=named_model,
-            # A report-back summary owes its pair's watch clear whichever
-            # agent answers it, so its finalize must see the pair.
-            run_metadata=(
-                {
-                    "report_back_ptc_thread_id": request.report_back_ptc_thread_id,
-                    "origin_dispatch_gen": request.origin_dispatch_gen,
-                }
-                if request.report_back_ptc_thread_id
-                else None
-            ),
-            extra_configurable=_automation_configurable(request),
-        )
 
     if not is_dispatch:
         return StreamingResponse(
             end_after_failure_frame(
                 observe_chat_stream(
                     gen,
-                    mode=runtime,
                     model=_model,
                     user_id=user_id,
                     workspace_id=workspace_id,
@@ -632,29 +606,76 @@ async def _handle_send_message(
             headers=sse_headers_with_loc,
         )
 
-    from src.server.database.runs.lifecycle import DuplicateRequestError
-    from src.server.handlers.chat.request_prep import DISPATCH_STARTED_MARKER
-    from src.server.services.report_back.flash import pointer, reserve
+    return await _prime_dispatch(
+        gen,
+        scope,
+        request,
+        thread_id=thread_id,
+        run_id=run_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        model=_model,
+    )
 
-    label = f"{runtime.upper()}_DISPATCH"
-    # The PTC response names the workspace, since a dispatch may have made it.
-    reply_extra = {"workspace_id": workspace_id} if runtime == "ptc" else {}
+
+async def _prime_dispatch(
+    gen,
+    scope,
+    request: ChatRequest,
+    *,
+    thread_id: str,
+    run_id: str,
+    user_id: str,
+    workspace_id: str,
+    model: str,
+) -> JSONResponse:
+    """Drive a background dispatch's turn to its START, answer with the run
+    and the workspace the turn resolved to, then drain ``gen`` in the
+    background.
+
+    Every exit that does not hand ``gen`` to that drain releases ``scope``'s
+    slot.
+    """
+    from src.server.database.runs.lifecycle import DuplicateRequestError
+    from src.server.handlers.chat.request_prep import (
+        DISPATCH_STARTED_MARKER,
+        DISPATCH_STEERED_MARKER,
+    )
+    from src.server.services.report_back.handoff import pointer, reserve
+
     # Report-back idempotency: a lost-response retry of the drainer's POST
-    # must NOT start a second summary run, whichever agent the summary lands
-    # on. The claim CM SET-NXs the per-(flash, ptc) run pointer (atomic on
-    # its own — no outer lock needed); a prior admission's incumbent run_id
-    # is returned instead, and a non-consummated exit (e.g. a priming failure
-    # below) releases the claim. No-op unless report_back_ptc_thread_id is set.
+    # must NOT start a second summary run. The claim CM SET-NXs the
+    # per-(dispatcher, ptc) run pointer (atomic on its own — no outer lock needed);
+    # a prior admission's incumbent run_id is returned instead, and a
+    # non-consummated exit (e.g. a priming failure below) releases the claim.
+    # No-op unless report_back_ptc_thread_id is set.
     rb_ptc = request.report_back_ptc_thread_id
     rb_cache = None
     if rb_ptc:
         from src.utils.cache.redis_cache import get_cache_client
         rb_cache = get_cache_client()
-    # A flash→PTC dispatch generation is gated on the PTC thread it starts;
+    # A dispatch generation is gated on the PTC thread it starts;
     # a report-back summary carries its pair's generation for the claim above.
-    gated_gen = (
-        request.origin_dispatch_gen if runtime == "ptc" and not rb_ptc else None
-    )
+    gated_gen = request.origin_dispatch_gen if not rb_ptc else None
+
+    async def steered(target_run_id: str) -> JSONResponse:
+        # The hand-off went into a running turn as a steer: this request's
+        # run never starts, so its pre-START stamp goes. The generation stays
+        # admitted on the ledger, where the steer stamped the running run.
+        await scope.release_slot()
+        if gated_gen:
+            await reserve.retract_dispatch_gen(thread_id, gated_gen, run_id)
+        logger.info(
+            f"[PTC_DISPATCH] Hand-off steered into running run {target_run_id} "
+            f"on thread {thread_id}"
+        )
+        return JSONResponse({
+            "status": "steered",
+            "thread_id": thread_id,
+            "run_id": target_run_id,
+            "workspace_id": workspace_id,
+        })
+
     async with pointer.claim(
         rb_cache, thread_id, rb_ptc, run_id,
         request.origin_dispatch_gen,
@@ -663,21 +684,21 @@ async def _handle_send_message(
         if rb_claim.incumbent is not None:
             await scope.release_slot()
             logger.info(
-                f"[{label}] Idempotent report-back: returning "
+                "[PTC_DISPATCH] Idempotent report-back: returning "
                 f"in-flight run {rb_claim.incumbent} for ptc={rb_ptc} on "
-                f"flash thread {thread_id} (no second run)"
+                f"thread {thread_id} (no second run)"
             )
             return JSONResponse({
                 "status": "dispatched",
                 "thread_id": thread_id,
                 "run_id": rb_claim.incumbent,
-                **reply_extra,
+                "workspace_id": workspace_id,
             })
         if rb_claim.pair_gone:
             await scope.release_slot()
             logger.warning(
-                f"[{label}] Report-back pair for ptc={rb_ptc} on "
-                f"flash thread {thread_id} was already settled; refusing "
+                f"[PTC_DISPATCH] Report-back pair for ptc={rb_ptc} on "
+                f"thread {thread_id} was already settled; refusing "
                 "to schedule an orphan summary"
             )
             # 410 is deliberately outside the executor's retry set: the
@@ -693,8 +714,8 @@ async def _handle_send_message(
         if rb_claim.in_flight:
             await scope.release_slot()
             logger.info(
-                f"[{label}] Report-back for ptc={rb_ptc} on "
-                f"flash thread {thread_id} has a rowless incumbent "
+                f"[PTC_DISPATCH] Report-back for ptc={rb_ptc} on "
+                f"thread {thread_id} has a rowless incumbent "
                 "inside its priming lease; deferring (503 retriable)"
             )
             # 503 is inside the executor's always-retried set: the
@@ -740,17 +761,19 @@ async def _handle_send_message(
         try:
             first = await anext(gen)
         except DuplicateRequestError as dup:
-            await scope.release_slot()
             existing = str(dup.existing_run["conversation_response_id"])
+            if dup.steered:
+                return await steered(existing)
+            await scope.release_slot()
             logger.info(
-                f"[{label}] Retransmit adopted existing run {existing} "
+                f"[PTC_DISPATCH] Retransmit adopted existing run {existing} "
                 f"for thread {thread_id}"
             )
             return JSONResponse({
                 "status": "dispatched",
                 "thread_id": thread_id,
                 "run_id": existing,
-                **reply_extra,
+                "workspace_id": workspace_id,
             })
         except HTTPException:
             await scope.release_slot()
@@ -765,6 +788,9 @@ async def _handle_send_message(
                 status_code=503,
                 detail=f"Dispatch could not start durably: {e}",
             )
+        if isinstance(first, str) and first.startswith(DISPATCH_STEERED_MARKER):
+            await gen.aclose()
+            return await steered(first[len(DISPATCH_STEERED_MARKER):])
         if first != DISPATCH_STARTED_MARKER:
             await gen.aclose()
             await scope.release_slot()
@@ -776,24 +802,23 @@ async def _handle_send_message(
 
     _track_task(asyncio.create_task(
         observe_background_chat_turn(
-            _consume_background_gen(gen, label, thread_id, run_id),
-            mode=runtime,
-            model=_model,
+            _consume_background_gen(gen, "PTC_DISPATCH", thread_id, run_id),
+            model=model,
             user_id=user_id,
             workspace_id=workspace_id,
             thread_id=thread_id,
         ),
-        name=f"{runtime}-dispatch-{thread_id}-{run_id[:8]}",
+        name=f"ptc-dispatch-{thread_id}-{run_id[:8]}",
     ))
     logger.info(
-        f"[{label}] Started background workflow: "
+        "[PTC_DISPATCH] Started background workflow: "
         f"thread_id={thread_id} run_id={run_id} workspace_id={workspace_id}"
     )
     return JSONResponse({
         "status": "dispatched",
         "thread_id": thread_id,
         "run_id": run_id,
-        **reply_extra,
+        "workspace_id": workspace_id,
     })
 
 
@@ -848,7 +873,7 @@ async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
     """Watch for new workflow activity on a thread via SSE + Redis pub/sub.
 
     Opens a lightweight SSE connection that emits a ``workflow_started`` event
-    each time a new workflow begins on this thread (e.g. a flash report-back
+    each time a new workflow begins on this thread (e.g. a report-back
     after a PTC completes). The connection stays open across the whole chain so
     N concurrent PTCs' report-backs are all delivered on one subscription; the
     client reconnects via ``/messages/stream`` per event and closes the watch
@@ -860,7 +885,7 @@ async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
     await auth_api.require_thread_owner(thread_id, x_user_id)
 
     from src.utils.cache.redis_cache import get_cache_client
-    from src.server.services.report_back.flash.core import watch_wakes
+    from src.server.services.report_back.handoff.core import watch_wakes
 
     async def watch_generator():
         cache = get_cache_client()
@@ -878,14 +903,14 @@ async def watch_thread(thread_id: str, x_user_id: CurrentUserId):
 async def replay_thread_messages(
     thread_id: str,
     x_user_id: CurrentUserId,
-    source: str = Query(
+    source: Literal["auto", "checkpoint"] = Query(
         "auto",
-        pattern="^(auto|checkpoint|sse)$",
         description=(
             "Replay source: 'checkpoint' projects the transcript from LangGraph "
-            "checkpoints, 'sse' replays persisted sse_events, 'auto' prefers "
-            "checkpoint, replaying from sse a turn it cannot project, or the "
-            "whole thread when coverage is incomplete."
+            "checkpoints and answers 409 when they cannot cover it; 'auto' "
+            "replays a turn it cannot project as its user message and closing "
+            "rows, and every turn that way when the thread's coverage is "
+            "incomplete."
         ),
     ),
     limit: int | None = Query(
@@ -911,8 +936,8 @@ async def replay_thread_messages(
     Stream includes:
     - history_page: first, only when ``limit`` or ``before_turn`` is given
     - user_message: emitted once per turn_index (query content)
-    - message_chunk/tool_* events: projected from checkpoints or emitted from
-      stored sse_events, per ``source``
+    - message_chunk/tool_* events: projected from checkpoints; a turn they
+      cannot cover sends only its closing rows (``source=auto``)
     - snapshot: cursors for the runs replay could not project (newest page only)
     - replay_done: terminal sentinel; on the newest page it also names the
       thread's newest run (``latest_run_id``), read before the transcript
@@ -1005,12 +1030,10 @@ async def replay_thread_messages(
             },
         )
 
-    except PoolTimeout:
-        raise HTTPException(
-            status_code=503,
-            detail="Database connection pool busy, please retry",
-            headers={"Retry-After": "2"},
-        )
+    except DATABASE_UNAVAILABLE as e:
+        # Replay ends the read on a database fault rather than show the
+        # thread as stubs.
+        raise database_unavailable(f"replaying thread {thread_id}", logger, e)
     except HTTPException:
         raise
     except Exception as e:
@@ -1049,25 +1072,24 @@ async def get_thread_status(
         raise HTTPException(status_code=404, detail="Thread not found")
     if meta["user_id"] != x_user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
-    # "" for a thread with no kind, so the report-back read takes it as known
-    # rather than looking the thread up again.
-    msg_type = meta.get("msg_type") or ""
-
     if fields == "report_back":
-        from src.server.services.report_back.flash.status import read_report_back_slice
+        from src.server.services.report_back.handoff.status import read_report_back_slice
 
-        return await read_report_back_slice(
-            thread_id, msg_type=msg_type, user_id=meta["user_id"]
-        )
+        return await read_report_back_slice(thread_id, user_id=meta["user_id"])
 
+    from src.server.database.runs import outbox as outbox_db
     from src.server.services.thread_status import read_thread_runtime_status
 
-    return await read_thread_runtime_status(
+    status = await read_thread_runtime_status(
         thread_id,
         is_shared=bool(meta["is_shared"]),
-        msg_type=msg_type,
         user_id=meta["user_id"],
     )
+    # The user's steers no run has read yet, such as those an errored turn
+    # left parked: the next turn reads them, and the view shows them queued
+    # until it does.
+    status["pending_steers"] = await outbox_db.list_pending_steers(thread_id)
+    return status
 
 
 # Upper bound on ids per liveness request — one MGET stays cheap. Ids past the
@@ -1362,6 +1384,14 @@ async def thread_stream_mux_endpoint(
             "settled-run catch-up window"
         ),
     ),
+    open_turn: bool = Query(
+        False,
+        description=(
+            "v2 only: the client's projection holds none of the executing "
+            "turn's settled runs (a fresh page), so drain them; acknowledged "
+            "by an `attached` control frame"
+        ),
+    ),
 ):
     """Multiplexed thread stream: every lane of the thread on one socket.
 
@@ -1380,7 +1410,12 @@ async def thread_stream_mux_endpoint(
     )
 
     return StreamingResponse(
-        stream_thread_mux_v2(thread_id, parse_mux_cursors_v2(cursors), since_age_s),
+        stream_thread_mux_v2(
+            thread_id,
+            parse_mux_cursors_v2(cursors),
+            since_age_s,
+            open_turn=open_turn,
+        ),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

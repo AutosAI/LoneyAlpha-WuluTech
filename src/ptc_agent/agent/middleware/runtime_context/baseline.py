@@ -116,6 +116,10 @@ _COUNT_QUERY_LIMIT = MEMO_DISPLAY_CAP + 1
 # diff honest and the history short. A judgement call, not a measured constant.
 DEFAULT_REBUILD_AFTER_UPDATES = 20
 
+# Epochs whose rendered block is kept: one for the main agent, one per run in
+# flight for a subagent's definition.
+_BLOCK_CACHE_SIZE = 8
+
 NamespaceFactory = Callable[[], tuple[str, ...]]
 
 #: Reads the current text of one harness-authored block from the turn's agent
@@ -170,11 +174,11 @@ class BaselineContextMiddleware(AgentMiddleware):
 
     Args:
         session: Workspace session, the agent.md read path. None disables the
-            agent.md tier entirely (Flash has no sandbox).
+            agent.md tier entirely.
         workspace_name: Workspace name as its row had it at agent build.
         workspace_description: Workspace description, from the same read.
         sources: Store-backed tiers to read (memory, memo). None reads neither.
-        blocks: Harness-authored text this flavor states, keyed by read kind
+        blocks: Harness-authored text this build states, keyed by read kind
             (see :data:`BlockReader`). A kind with no reader is a block this
             build does not have, which renders nothing and files no row.
         user_profile: Identity plus the steering it carries (locale language
@@ -182,11 +186,9 @@ class BaselineContextMiddleware(AgentMiddleware):
         user_data_counts: Portfolio/watchlist/preference counts, snapshot at
             agent build. Counts drift within a turn, so the snapshot is what
             renders rather than a live read.
-        sandbox_enabled: Whether the agent has a filesystem. It gates the
-            filesystem-dependent steering in the user_profile component, and
-            it is the build that has a workspace to read, so it decides
-            whether a missing ``workspace_name`` is a read that did not answer
-            or a build with no workspace.
+        sandbox_enabled: Whether the agent can open files. False for a
+            subagent without file tools: its memory index renders read-only,
+            since the detail files it points to cannot be opened.
         preferred_market: Market the identity block reports, from
             ``resolve_preferred_market``.
         timezone: The turn's zone, which the identity block states ahead of
@@ -204,6 +206,11 @@ class BaselineContextMiddleware(AgentMiddleware):
         channels_enabled: Whether the agent has the chat-app settings folder,
             which a rebuild freezes for the block to state. None for a build
             whose block says nothing about it.
+        subagent: A subagent's baseline. It has no workspace block and a
+            profile without the main agent's filesystem steering, reads memory
+            without being told to write it, and its scratchpad has no notes.
+            One instance serves every run of its definition in a parent turn,
+            each with its own epoch in that run's checkpoint.
     """
 
     def __init__(
@@ -216,7 +223,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         blocks: dict[str, BlockReader] | None = None,
         user_profile: dict[str, Any] | None = None,
         user_data_counts: dict[str, Any] | None = None,
-        sandbox_enabled: bool = False,
+        sandbox_enabled: bool = True,
         preferred_market: str | None = None,
         timezone: str | None = None,
         guidance: str | None = None,
@@ -226,16 +233,16 @@ class BaselineContextMiddleware(AgentMiddleware):
         files_mounted: bool | None = None,
         role: AgentRole = "analyst",
         channels_enabled: bool | None = None,
+        subagent: bool = False,
     ) -> None:
         super().__init__()
+        self._subagent = subagent
         self._session = session
         self._role = role
         self._files_mounted = files_mounted
         self._channels_enabled = channels_enabled
-        # None is a read that did not answer (or a build with no workspace);
-        # an empty string is a workspace with no name. Only the first is kept
-        # out of change detection, and ``sandbox_enabled`` below tells the two
-        # meanings of None apart at rebuild time.
+        # None is a read that did not answer; an empty string is a workspace
+        # with no name. Only the first is kept out of change detection.
         self._workspace_available = workspace_name is not None
         self._workspace_name = (workspace_name or "").strip()
         self._workspace_description = (workspace_description or "").strip()
@@ -278,10 +285,13 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._model_name = model_name
         self._rebuild_after_updates = max(0, rebuild_after_updates)
         self._read_timeout_s = read_timeout_s
-        # Rendered block, memoized per epoch. The memo is what makes
+        # Rendered blocks, memoized per epoch. The memo is what makes
         # byte-identity a property of the code rather than of the templates
-        # happening to be deterministic.
-        self._block_cache: tuple[Any, str] | None = None
+        # happening to be deterministic. More than one entry because a
+        # subagent's instance renders for every run of its definition at once,
+        # and the scratchpad is in the key because it is what tells two runs'
+        # blocks apart.
+        self._block_cache: dict[tuple[Any, ...], str] = {}
 
     # -- rendering inputs ---------------------------------------------------
 
@@ -354,9 +364,12 @@ class BaselineContextMiddleware(AgentMiddleware):
     ) -> dict[str, Any] | None:
         # A turn that resumes an interrupt re-enters the graph at the
         # interrupted node, never at the entry node, so ``abefore_agent`` does
-        # not run for it. The instance is built per request, so a first model
-        # call on one that never opened a turn is that resume: the boundary
-        # read runs here instead, after the tool result the resume produced.
+        # not run for it. A main agent's instance is built per request, so a
+        # first model call on one that never opened a turn is that resume: the
+        # boundary read runs here instead, after the tool result the resume
+        # produced. A subagent's instance serves every run of its definition in
+        # the parent's turn, and each of those runs enters through
+        # ``abefore_agent``.
         if self._opened:
             return None
         return await self.abefore_agent(state, runtime)
@@ -391,7 +404,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             retained_rows=_retained_change_rows(state),
             profile_available=self._profile_available,
             workspace_available=self._workspace_available,
-            workspace_configured=self._sandbox_enabled,
+            workspace_configured=not self._subagent,
             files_mounted=self._files_mounted,
             channels_enabled=self._channels_enabled,
         )
@@ -578,7 +591,10 @@ class BaselineContextMiddleware(AgentMiddleware):
                 continue
             parts.append(
                 render_template(
-                    HARNESS_BLOCKS[kind].template, content=entry.text, guidance=guidance
+                    HARNESS_BLOCKS[kind].template,
+                    content=entry.text,
+                    guidance=guidance,
+                    subagent=self._subagent,
                 )
             )
 
@@ -608,6 +624,7 @@ class BaselineContextMiddleware(AgentMiddleware):
                     path=entry.path or tier,
                     content=entry.text,
                     readonly=not self._sandbox_enabled,
+                    subagent=self._subagent,
                     guidance=guidance,
                 )
             )
@@ -635,13 +652,14 @@ class BaselineContextMiddleware(AgentMiddleware):
             channels = self._channels_enabled
         if not snapshot.user_profile and not snapshot.user_data_counts:
             return ""
+        # A subagent's profile leaves out what only the main agent acts on:
+        # the profile files, the delivery format and where settings live.
         try:
             content = render_template(
                 "components/user_profile.md.j2",
                 user_profile=snapshot.user_profile,
                 user_data_counts=snapshot.user_data_counts or None,
-                sandbox_enabled=self._sandbox_enabled,
-                profile_files=self._sandbox_enabled,
+                main_agent_steering=not self._subagent,
                 channels_enabled=bool(channels),
             )
         except Exception:  # noqa: BLE001 - one component is not the whole block
@@ -690,11 +708,14 @@ class BaselineContextMiddleware(AgentMiddleware):
         return await handler(request.override(system_message=system_message))
 
     def _cached_block(self, epoch: BaselineEpoch) -> str:
-        key = (epoch.epoch, epoch.built_at)
-        if self._block_cache is not None and self._block_cache[0] == key:
-            return self._block_cache[1]
-        block = self._render_block(epoch)
-        self._block_cache = (key, block)
+        scratchpad = epoch.blocks.get("scratchpad")
+        key = (epoch.epoch, epoch.built_at, scratchpad.text if scratchpad else None)
+        block = self._block_cache.get(key)
+        if block is None:
+            block = self._render_block(epoch)
+            if len(self._block_cache) >= _BLOCK_CACHE_SIZE:
+                self._block_cache.pop(next(iter(self._block_cache)))
+            self._block_cache[key] = block
         return block
 
 
@@ -724,7 +745,7 @@ def _workspace_block(workspace: Workspace) -> str:
 async def _read_sandbox_text(session: Any, relative_path: str) -> str | None:
     """One workspace file's text, or None when the file does not exist.
 
-    A session without a sandbox (Flash, a test double) reads as absent rather
+    A session without a sandbox (a test double) reads as absent rather
     than as an error, since there is no file for it to have.
     """
     sandbox = getattr(session, "sandbox", None)

@@ -41,7 +41,7 @@ ENVELOPE_CASES: dict[str, dict] = {
         "market": "US",
         "surface": "market_view",
         "symbol": "AAPL",
-        "origin": "automation",
+        "started_by": "automation",
         "is_subagent": False,
         "surface_rules": "Surface market_view: ...",
     },
@@ -90,7 +90,6 @@ ENVELOPE_CASES: dict[str, dict] = {
     "envelope/baseline_memory.md.j2": {
         "path": ".agents/user/memory/memory.md",
         "content": "- [Style](feedback_style.md) how they want reports written",
-        "readonly": False,
     },
     "envelope/baseline_identity.md.j2": {
         "name": "Alan",
@@ -310,30 +309,6 @@ class TestBaselineDeterminism:
         assert "<memory" in memory and "does not exist yet" not in memory
         assert "exists yet" in memory
 
-    def test_a_build_with_no_filesystem_is_not_told_to_write_memory(self):
-        """Flash reads the index but has no tool that could create the file."""
-        loader = init_loader()
-        absent = loader.render(
-            "envelope/baseline_memory.md.j2",
-            path=".agents/user/memory/memory.md",
-            content="",
-            readonly=True,
-        )
-        assert "exists yet" in absent and "create a typed detail file" not in absent
-        present = loader.render(
-            "envelope/baseline_memory.md.j2",
-            path=".agents/user/memory/memory.md",
-            content="- [Style](feedback_style.md) how they want reports written",
-            readonly=True,
-        )
-        assert "Read-only here" in present
-        writable = loader.render(
-            "envelope/baseline_memory.md.j2",
-            path=".agents/user/memory/memory.md",
-            content="- [Style](feedback_style.md) how they want reports written",
-        )
-        assert "Read-only" not in writable
-
 
 class TestMissingKwargsDropTheLine:
     """A fragment whose values never arrived renders as nothing.
@@ -366,7 +341,7 @@ class TestMissingKwargsDropTheLine:
         assert loader.render("envelope/turn.md.j2", surface="web").strip() == (
             "Surface `web`"
         )
-        assert loader.render("envelope/turn.md.j2", origin="automation").strip() == (
+        assert loader.render("envelope/turn.md.j2", started_by="automation").strip() == (
             "Started by automation"
         )
 

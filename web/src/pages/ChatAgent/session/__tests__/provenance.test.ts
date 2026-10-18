@@ -12,8 +12,6 @@ describe('senderProvenance', () => {
   it('labels a hand-off by the agent that dispatched it', () => {
     expect(senderProvenance({ origin: { type: 'agent', id: 'th-home', agent: 'chief_of_staff' } }))
       .toEqual({ kind: 'agent', agent: 'chief_of_staff', threadId: 'th-home' });
-    expect(senderProvenance({ origin: { type: 'agent', id: 'th-flash', agent: 'flash' } }))
-      .toEqual({ kind: 'agent', agent: 'flash', threadId: 'th-flash' });
   });
 
   it('leaves the dispatcher open on a hand-off recorded before it was named', () => {

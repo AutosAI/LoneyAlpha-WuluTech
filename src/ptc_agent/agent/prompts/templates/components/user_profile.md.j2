@@ -3,7 +3,7 @@
 - **Name**: {{ user_profile.name | default("User") }}
 - **Timezone**: {{ user_profile.timezone | default("UTC") }}
 - **Locale**: {{ user_profile.locale | default("en-US", true) }}
-{% if profile_files %}
+{% if main_agent_steering %}
 
 To change one of these, edit `.agents/user/profile/user.json`.
 {% endif %}
@@ -20,7 +20,7 @@ You MUST follow these user preferences when responding:
 {% for key, value in user_profile.agent_preference.items() if key != "output_format" %}
 - **{{ key }}**: {{ value }}
 {% endfor %}
-{% if sandbox_enabled and user_profile.agent_preference.output_format == "html" %}
+{% if main_agent_steering and user_profile.agent_preference.output_format == "html" %}
 
 ### Output Format: Styled HTML
 
@@ -30,7 +30,7 @@ For substantial deliverables (reports, analyses, comparisons), produce a styled 
 
 ## Financial Context
 
-{% if profile_files %}
+{% if main_agent_steering %}
 When handling investment-related queries, check these JSON files under `.agents/user/profile/`. They serve fresh DB-backed data on every read and accept atomic JSON edits (validated server-side):
 
 | File | Contains | Check when... |
@@ -66,11 +66,15 @@ When handling investment-related queries, check these JSON files under `.agents/
 {% set trading_settings_url = user_profile.trading_settings_url %}
 {% include "components/trading_permission.md.j2" %}
 {% endif %}
-{% if sandbox_enabled %}
+{% if main_agent_steering %}
 
 ## Automations
 
 The user's scheduled and price-triggered automations live in `.agents/user/automations/`, one JSON file per automation: write a new file to create one, and edit a file to change, pause or delete it. Read the README there before your first edit, and confirm with the user before you create or delete one.
+
+## Subagents
+
+Your subagents are set up in `.agents/user/agents/`, one markdown file each: edit a file's frontmatter to change its model, effort, tools or whether it is in your roster, and write a new file to create one. Read the README there before your first edit, and confirm with the user before you create or delete a subagent or change its model.
 {% endif %}
 {% if channels_enabled %}
 

@@ -35,7 +35,7 @@ MAX_ATTEMPTS = 5
 MAX_CONCURRENT_JOBS = 10
 # task_report_back jobs hold their slot through an entire PTC notification
 # turn (sandbox bringup + a full agent run — tens of minutes); cap their
-# share so a burst of tail completions can't starve flash report-backs and
+# share so a burst of tail completions can't starve hand-off report-backs and
 # cheap wakes. Excluded types stay unclaimed but still head their chains.
 TASK_RB_INFLIGHT_QUOTA = 3
 # How long shutdown waits for the loop, and then for its in-flight jobs.
@@ -78,9 +78,9 @@ _EXECUTORS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {
 # "reconcile now" wake whose whole point is that the row is no longer open).
 # A failure never un-acks the job.
 _CLOSE_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
-# One-shot startup sweeps (e.g. legacy-state migration). The drainer runs
-# every registered sweep as a BARRIER before its first claim.
-_STARTUP_SWEEPS: list[Callable[[], Awaitable[None]]] = []
+# Best-effort followups for a row its type settles itself at the attempts
+# ceiling rather than parking it dead (a steer, ``outbox._exhaust_steers``).
+_EXHAUST_FOLLOWUPS: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
 
 
 def register_hook_executor(
@@ -88,6 +88,7 @@ def register_hook_executor(
     executor: Callable[[Dict[str, Any]], Awaitable[None]],
     *,
     on_closed: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    on_exhausted: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
 ) -> None:
     """Bind a hook_type to its executor. Idempotent for the same function;
     a different executor for a registered type is a wiring bug — raise."""
@@ -100,11 +101,8 @@ def register_hook_executor(
     _EXECUTORS[hook_type] = executor
     if on_closed is not None:
         _CLOSE_FOLLOWUPS[hook_type] = on_closed
-
-
-def register_startup_sweep(sweep: Callable[[], Awaitable[None]]) -> None:
-    if sweep not in _STARTUP_SWEEPS:
-        _STARTUP_SWEEPS.append(sweep)
+    if on_exhausted is not None:
+        _EXHAUST_FOLLOWUPS[hook_type] = on_exhausted
 
 
 # Dead-letter compensation (a dead report_back's watch_clear) is inserted
@@ -197,28 +195,7 @@ class HookOutboxDrainer:
         self._nudge.set()
 
     async def _loop(self) -> None:
-        legacy_swept = False
         while not self._stopping.is_set():
-            if not legacy_swept:
-                try:
-                    for sweep in _STARTUP_SWEEPS:
-                        await sweep()
-                    legacy_swept = True
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # The sweep is a BARRIER: claiming before unmigrated rows
-                    # are rekeyed would run them outside their real chain, and
-                    # a claimed row can no longer be rekeyed. Idempotent, so
-                    # back off and retry until it lands.
-                    logger.error(
-                        "[HookOutbox] legacy FIFO migration failed; deferring "
-                        "claims until it succeeds",
-                        exc_info=True,
-                    )
-                    await self._wait_for_nudge()
-                    continue
-
             # Dead-park expired claims that already burned max_attempts leases
             # (crashed owners never nack); their chains unwedge here. The
             # watch_clear compensation rides the same statement.
@@ -226,6 +203,9 @@ class HookOutboxDrainer:
                 for parked in await outbox_db.park_exhausted_jobs(
                     max_attempts=MAX_ATTEMPTS
                 ):
+                    if parked.get("status") != "dead":
+                        await self._exhausted(parked)
+                        continue
                     logger.error(
                         f"[HookOutbox] parked exhausted job="
                         f"{parked.get('hook_outbox_id')} "
@@ -361,7 +341,9 @@ class HookOutboxDrainer:
             except Exception:
                 logger.error(f"[HookOutbox] nack failed for {job_id}", exc_info=True)
                 return
-            if new_status == "dead":
+            if new_status == "exhausted":
+                await self._exhausted(job)
+            elif new_status == "dead":
                 # A dead report_back's watch_clear compensation was
                 # inserted atomically by the nack statement itself.
                 logger.error(
@@ -379,6 +361,26 @@ class HookOutboxDrainer:
             logger.warning(f"[HookOutbox] ack failed for {job_id}", exc_info=True)
             return
         await self._close_followup(job)
+
+    async def _exhausted(self, job: Dict[str, Any]) -> None:
+        """A row out of attempts that its type settled rather than letting it
+        go dead: worth a warning, not a dead letter, and no close followup."""
+        logger.warning(
+            f"[HookOutbox] job={job.get('hook_outbox_id')} "
+            f"type={job.get('hook_type')} out of attempts after "
+            f"{job.get('attempts')}; settled by its type"
+        )
+        followup = _EXHAUST_FOLLOWUPS.get(job.get("hook_type") or "")
+        if followup is None:
+            return
+        try:
+            await followup(job)
+        except Exception:
+            logger.debug(
+                f"[HookOutbox] exhaust followup failed for "
+                f"{job.get('hook_outbox_id')} type={job.get('hook_type')}",
+                exc_info=True,
+            )
 
     async def _close_followup(self, job: Dict[str, Any]) -> None:
         followup = _CLOSE_FOLLOWUPS.get(job.get("hook_type") or "")

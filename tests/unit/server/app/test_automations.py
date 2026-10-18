@@ -40,7 +40,6 @@ def _automation(automation_id=None, user_id="test-user-123", **overrides):
         "trigger_config": None,
         "next_run_at": NOW,
         "last_run_at": None,
-        "agent_mode": "flash",
         "instruction": "Give me a market summary",
         "workspace_id": None,
         "llm_model": None,
@@ -386,6 +385,20 @@ async def test_update_takes_the_users_own_time_and_zone(client, fields, field, s
     assert update.await_args.kwargs["fields"][field] == stored
 
 
+HOME_ID = "6f18b8ab-0000-5000-8000-000000000000"
+
+
+@pytest.fixture
+def in_home():
+    """Home's row is there, so a create naming Home places the automation in it."""
+    with patch(
+        "src.server.services.automations.lifecycle._home",
+        new_callable=AsyncMock,
+        return_value=HOME_ID,
+    ):
+        yield
+
+
 @pytest.fixture
 def unknown_models():
     """The user can run no model by the name asked for."""
@@ -408,7 +421,7 @@ def unknown_models():
 
 
 @pytest.mark.asyncio
-async def test_create_with_an_unknown_model_is_409(client, unknown_models):
+async def test_create_with_an_unknown_model_is_409(client, unknown_models, in_home):
     with patch(HANDLER_DB) as db:
         db.create_automation = AsyncMock()
         resp = await client.post(
@@ -418,6 +431,7 @@ async def test_create_with_an_unknown_model_is_409(client, unknown_models):
                 "trigger_type": "cron",
                 "cron_expression": "0 8 * * *",
                 "instruction": "Give me a market summary",
+                "workspace_id": _home()["workspace_id"],
                 "llm_model": "no-such-model",
             },
         )
@@ -576,7 +590,7 @@ def _run(**overrides):
     """An execution as the run query returns it, its automation's identity
     included."""
     return _execution(
-        automation_name="Daily Briefing", agent_mode="flash", trigger_type="cron",
+        automation_name="Daily Briefing", trigger_type="cron",
         **overrides,
     )
 
@@ -769,10 +783,10 @@ OPTIONS_URL = f"/api/v1/automations/delivery-options?workspace_id={WS_ID}"
 
 def _home() -> dict:
     """The user's Home, bound to their computer so it reads its status."""
-    from src.server.database.home_workspace import get_flash_workspace_id
+    from src.server.database.home_workspace import get_home_workspace_id
 
     return {
-        "workspace_id": get_flash_workspace_id("test-user-123"),
+        "workspace_id": get_home_workspace_id("test-user-123"),
         "user_id": "test-user-123",
         "status": "running",
     }
@@ -1151,6 +1165,7 @@ _PAST_THE_LIMIT = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("in_home")
 async def test_create_with_too_many_delivery_entries_is_refused(client):
     with patch(f"{HANDLER_DB}.create_automation", new_callable=AsyncMock) as create:
         resp = await client.post(
@@ -1160,6 +1175,7 @@ async def test_create_with_too_many_delivery_entries_is_refused(client):
                 "trigger_type": "cron",
                 "cron_expression": "0 8 * * *",
                 "instruction": "test",
+                "workspace_id": _home()["workspace_id"],
                 "delivery_config": {"methods": _TWENTY_ONE},
             },
         )

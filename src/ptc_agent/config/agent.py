@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ptc_agent.config.plugins import bundled_skill_dirs
 from ptc_agent.config.core import (
@@ -88,15 +88,6 @@ COMPACTION_PROFILES: dict[str, dict[str, int]] = {
 }
 
 
-class FlashConfig(BaseModel):
-    """Flash agent configuration.
-
-    Flash agent is a lightweight agent optimized for speed
-    """
-
-    enabled: bool = True
-
-
 #: The operator's own drop-in directory, and the one place to override a
 #: shipped skill. Absolute rather than relative to the working directory, so it
 #: means the same thing whether the server was started from the repo or from
@@ -154,20 +145,41 @@ class SkillsConfig(BaseModel):
 
 
 class SubagentConfig(BaseModel):
-    """Configuration for a single subagent definition (built-in override or user-defined)."""
+    """One subagent definition in the deployment's YAML.
 
-    description: str
-    mode: Literal["ptc", "flash"] = "ptc"
+    Named after a built-in, it changes only the fields it sets, as an overlay
+    does, so the defaults below apply only to a subagent of the deployment's
+    own, which also needs a ``description``.
+    """
+
+    description: str | None = None
     model: str | None = None
     role_prompt: str = ""
     role_prompt_template: str | None = None
     custom_prompt_template: str | None = None
     custom_prompt: str | None = None
     tools: list[str] = Field(default_factory=lambda: ["execute_code", "filesystem"])
-    skills: list[str] = Field(default_factory=list)
     preload_skills: list[str] = Field(default_factory=list)
-    max_iterations: int = 15
     sections: dict[str, bool] = Field(default_factory=dict)
+    reasoning_effort: str | None = None
+    search_provider: str | None = None
+    search_depth: str | None = None
+    connectors: bool = True
+    brokerages: Literal["off", "on"] = "on"
+    preferred_connectors: list[str] = Field(default_factory=list)
+    # Unset is on for a subagent of the deployment's own.
+    memory: bool | None = None
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _effort_is_a_level(cls, value: str | None) -> str | None:
+        # A word outside the vocabulary would reach no model: the client falls
+        # back to the model's default while the pane shows the word.
+        from src.llms.reasoning import REASONING_LEVELS
+
+        if value is not None and value not in REASONING_LEVELS:
+            raise ValueError(f"must be one of {', '.join(REASONING_LEVELS)}")
+        return value
 
 
 class SubagentsConfig(BaseModel):
@@ -179,6 +191,27 @@ class SubagentsConfig(BaseModel):
 
     enabled: list[str] = Field(default_factory=lambda: ["general-purpose"])
     definitions: dict[str, SubagentConfig] = Field(default_factory=dict)
+    #: This user's merged roster (a ``ResolvedSubagents``), written on the
+    #: per-turn copy by ``resolve_llm_config`` for a PTC build. None on the
+    #: shared config and on builds that never resolved a user, which compile
+    #: the deployment's own roster (``merge.turn_roster``).
+    resolved: Any | None = Field(default=None, exclude=True)
+
+    @field_validator("definitions")
+    @classmethod
+    def _new_subagents_have_descriptions(
+        cls, value: dict[str, SubagentConfig]
+    ) -> dict[str, SubagentConfig]:
+        # The parent delegates by the description, and a built-in brings its own.
+        from ptc_agent.agent.subagents.builtins import BUILTIN_SUBAGENTS
+
+        for name, defn in value.items():
+            if name not in BUILTIN_SUBAGENTS and not defn.description:
+                raise ValueError(
+                    f"Invalid subagent definition '{name}': a subagent that is "
+                    "not built in needs a description"
+                )
+        return value
 
 
 class LLMDefinition(BaseModel):
@@ -204,33 +237,33 @@ class LLMConfig(BaseModel):
     """LLM configuration - references an LLM from models.json."""
 
     name: str  # Name/alias from src/llms/manifest/models.json
-    flash: str | None = None  # LLM for flash agent, defaults to main llm if None
+    background: str | None = None  # Background model, defaults to main llm if None
     compaction: str | None = None  # LLM for context compaction (summarization step)
     fetch: str | None = None  # LLM for web content extraction (fetch tool)
     fallback: list[str] | None = None  # Fallback model names for retry exhaustion
 
     @property
-    def flash_name(self) -> str:
-        """The model a flash turn actually runs on, resolving the ``name`` fallback.
+    def background_name(self) -> str:
+        """The Background model, resolving the ``name`` fallback.
 
-        Callers outside the flash agent (metadata, tuning lookups) have to agree
-        with it on which model that is, so the rule lives here rather than being
-        spelled out at each site.
+        Callers (metadata, tuning lookups) have to agree on which model that
+        is, so the rule lives here rather than being spelled out at each site.
         """
-        return self.flash or self.name
+        return self.background or self.name
 
-    # Blank fetch means "whatever flash is for this turn". Resolved on read, not
-    # at load: a user's flash preference replaces ``flash`` per turn, and a
-    # value baked in at load would keep the deployment's flash instead. Blank
-    # compaction means the model the turn runs, which a server turn writes in
-    # (``select_model``); read here it is the PTC model.
+    # Blank fetch means "whatever the Background model is for this turn".
+    # Resolved on read, not at load: a user's Background preference replaces
+    # ``background`` per turn, and a value baked in at load would keep the
+    # deployment's instead. Blank compaction means the model the turn runs,
+    # which a server turn writes in (``select_model``); read here it is the
+    # primary model.
     @property
     def compaction_name(self) -> str | None:
         return self.compaction or self.name
 
     @property
     def fetch_name(self) -> str | None:
-        return self.fetch or self.flash
+        return self.fetch or self.background
 
 
 class AgentConfig(BaseModel):
@@ -252,9 +285,6 @@ class AgentConfig(BaseModel):
 
     # Skills configuration
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
-
-    # Flash agent configuration
-    flash: FlashConfig = Field(default_factory=FlashConfig)
 
     # Custom model input modalities override (set by resolve_llm_config for custom models)
     input_modalities: list[str] | None = None

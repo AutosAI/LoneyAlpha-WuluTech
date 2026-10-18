@@ -9,7 +9,6 @@ Covers:
 - LLMConfig fields and defaults
 - SubagentConfig / SubagentsConfig
 - SkillsConfig path resolution
-- FlashConfig defaults
 """
 
 import os
@@ -20,7 +19,6 @@ import pytest
 
 from ptc_agent.config.agent import (
     AgentConfig,
-    FlashConfig,
     LLMConfig,
     LLMDefinition,
     SkillsConfig,
@@ -68,7 +66,7 @@ class TestLLMConfig:
     def test_defaults(self):
         cfg = LLMConfig(name="gpt-4o")
         assert cfg.name == "gpt-4o"
-        assert cfg.flash is None
+        assert cfg.background is None
         assert cfg.compaction is None
         assert cfg.fetch is None
         assert cfg.fallback is None
@@ -76,12 +74,12 @@ class TestLLMConfig:
     def test_all_fields(self):
         cfg = LLMConfig(
             name="claude-sonnet-4-5",
-            flash="claude-haiku-4-5",
+            background="claude-haiku-4-5",
             compaction="claude-haiku-4-5",
             fetch="claude-haiku-4-5",
             fallback=["gpt-4o", "gpt-4o-mini"],
         )
-        assert cfg.flash == "claude-haiku-4-5"
+        assert cfg.background == "claude-haiku-4-5"
         assert cfg.fallback == ["gpt-4o", "gpt-4o-mini"]
 
 
@@ -319,21 +317,23 @@ class TestAgentConfigGetLlmClient:
 class TestSubagentConfig:
     def test_defaults(self):
         cfg = SubagentConfig(description="Test agent")
-        assert cfg.mode == "ptc"
         assert cfg.model is None
         assert cfg.tools == ["execute_code", "filesystem"]
-        assert cfg.max_iterations == 15
 
     def test_custom_fields(self):
         cfg = SubagentConfig(
             description="Research",
-            mode="flash",
             model="claude-haiku-4-5",
             tools=["web_search"],
-            max_iterations=5,
         )
-        assert cfg.mode == "flash"
         assert cfg.model == "claude-haiku-4-5"
+        assert cfg.tools == ["web_search"]
+
+    def test_effort_is_a_level_of_the_vocabulary(self):
+        # An unknown word would reach no model while the pane showed it.
+        assert SubagentConfig(description="Deep", reasoning_effort="max").reasoning_effort == "max"
+        with pytest.raises(ValueError, match="reasoning_effort"):
+            SubagentConfig(description="Deep", reasoning_effort="ultra")
 
 
 class TestSubagentsConfig:
@@ -341,6 +341,13 @@ class TestSubagentsConfig:
         cfg = SubagentsConfig()
         assert cfg.enabled == ["general-purpose"]
         assert cfg.definitions == {}
+
+    def test_a_new_subagent_needs_a_description_on_every_path(self):
+        # A built-in brings its own; a new name built in code, not just from
+        # YAML, is refused without one, since the parent delegates by it.
+        assert SubagentsConfig(definitions={"research": SubagentConfig(model="m")})
+        with pytest.raises(ValueError, match="'macro'.*needs a description"):
+            SubagentsConfig(definitions={"macro": SubagentConfig(model="m")})
 
 
 # ---------------------------------------------------------------------------
@@ -374,17 +381,6 @@ class TestSkillsConfig:
         before = cfg.local_skill_dirs_with_sandbox()
         monkeypatch.chdir(tmp_path)
         assert cfg.local_skill_dirs_with_sandbox() == before
-
-
-# ---------------------------------------------------------------------------
-# FlashConfig
-# ---------------------------------------------------------------------------
-
-
-class TestFlashConfig:
-    def test_defaults(self):
-        cfg = FlashConfig()
-        assert cfg.enabled is True
 
 
 # ---------------------------------------------------------------------------

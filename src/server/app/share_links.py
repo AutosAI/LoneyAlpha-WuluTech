@@ -10,6 +10,7 @@ Endpoints, all owner-only:
 - GET   /api/v1/workspaces/{id}/share-links                - the shared links here
 - GET   /api/v1/workspaces/{id}/share-links/{code}/files   - the current file list
 - PATCH /api/v1/workspaces/{id}/share-links/{code}         - share with a reviewed list, or stop
+- GET   /api/v1/share-links/{code}                         - one of the owner's links, any workspace
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from pydantic import BaseModel, Field
 from src.server.app.share_access import ShareScope, shared_path_visible
 from src.server.app.workspace_files._containment import contained_relative_path
 from src.server.app.workspace_files._shared import (
-    _is_flash_workspace,
+    owned_workspace_on_computer,
     owner_work_dir,
     previous_dir_names_of,
 )
@@ -48,9 +49,10 @@ from src.server.app.share_manifest import (
     build_manifest,
     manifest_drift,
 )
-from src.server.utils.api import CurrentUserId, require_workspace_owner
+from src.server.utils.api import CurrentUserId
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Share Links"])
+owner_router = APIRouter(prefix="/api/v1/share-links", tags=["Share Links"])
 
 
 class ShareLinkCreate(BaseModel):
@@ -66,6 +68,7 @@ class ShareLinkUpdate(BaseModel):
 
 class ShareLinkResponse(BaseModel):
     code: str
+    workspace_id: str
     url: str
     kind: str
     path: str | None
@@ -85,6 +88,7 @@ class FileGrantResponse(BaseModel):
 def _to_model(link: ShareLink) -> ShareLinkResponse:
     return ShareLinkResponse(
         code=link.code,
+        workspace_id=link.workspace_id,
         url=share_path(link.code),
         kind=link.kind,
         path=link.path,
@@ -98,12 +102,7 @@ def _to_model(link: ShareLink) -> ShareLinkResponse:
 
 
 async def _owned_workspace(workspace_id: str, user_id: str) -> tuple[dict[str, Any], str]:
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=user_id)
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have shareable files"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, user_id)
     return workspace, owner_work_dir(workspace)
 
 
@@ -225,3 +224,20 @@ async def update_share_link(
     if shared is None:
         raise HTTPException(status_code=409, detail={"code": "link_changed"})
     return _to_model(shared)
+
+
+@owner_router.get("/{code}", response_model=ShareLinkResponse)
+async def get_share_link(code: str, x_user_id: CurrentUserId) -> ShareLinkResponse:
+    """What one of the owner's links points at, so their app can open it in place.
+
+    The workspace list holds shared links only, and an app link is never shared,
+    so an ``/a/`` link in a reply is mapped back to its port or file through
+    this. Any of the owner's workspaces answers, since a report-back carries an
+    analyst's links into Home; the link names the workspace to open it in.
+    Another user's code is not found rather than forbidden.
+    """
+    link = await get_link(code)
+    workspace = await db_get_workspace(link.workspace_id) if link else None
+    if link is None or workspace is None or workspace.get("user_id") != x_user_id:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    return _to_model(link)

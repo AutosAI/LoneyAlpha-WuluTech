@@ -439,6 +439,23 @@ class _ScheduleFields(BaseModel):
             )
 
 
+def _refuse_retired_agent_mode(value: Any) -> Any:
+    # 'flash' ran the automation in Home whatever workspace_id said; dropped
+    # unread, it would stay where workspace_id says. 'ptc' changed nothing.
+    # Any other value was refused while the field existed, so it still is.
+    if not isinstance(value, dict):
+        return value
+    mode = value.get("agent_mode")
+    if mode == "flash":
+        raise ValueError(
+            "agent_mode was retired: to run in Home, set workspace_id to the "
+            "id POST /api/v1/workspaces/home returns"
+        )
+    if mode not in (None, "ptc"):
+        raise ValueError("agent_mode was retired; remove it")
+    return value
+
+
 class AutomationCreate(_ScheduleFields):
     """Request model for creating an automation."""
 
@@ -454,14 +471,13 @@ class AutomationCreate(_ScheduleFields):
     )
 
     # Agent config
-    agent_mode: Literal["ptc", "flash"] = Field(
-        default="flash", description="Agent mode for execution"
-    )
     instruction: str = Field(
         ..., min_length=1, description="The prompt/instruction for the agent"
     )
     workspace_id: Optional[UUID] = Field(
-        None, description="Workspace ID (required for 'ptc' mode)"
+        None,
+        description="Workspace each run happens in; Home's id (POST "
+        "/workspaces/home) for the user's Home. Required.",
     )
     llm_model: Optional[str] = Field(
         None, max_length=100, description="LLM model name override"
@@ -494,6 +510,11 @@ class AutomationCreate(_ScheduleFields):
         default=None, description="Arbitrary metadata"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_agent_mode(cls, value: Any) -> Any:
+        return _refuse_retired_agent_mode(value)
+
     @model_validator(mode="after")
     def _schedule_fits_the_kind(self) -> "AutomationCreate":
         field = SCHEDULE_FIELD[self.trigger_type]
@@ -518,7 +539,6 @@ class AutomationUpdate(_ScheduleFields):
     trigger_type: Optional[TriggerType] = None
 
     # Agent config
-    agent_mode: Optional[Literal["ptc", "flash"]] = None
     instruction: Optional[str] = Field(None, min_length=1)
     workspace_id: Optional[UUID] = None
     llm_model: Optional[str] = Field(None, max_length=100)
@@ -537,6 +557,11 @@ class AutomationUpdate(_ScheduleFields):
         description="Delivery configuration: { methods: ['slack', ...] }",
     )
     metadata: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retired_agent_mode(cls, value: Any) -> Any:
+        return _refuse_retired_agent_mode(value)
 
     @model_validator(mode="after")
     def _keeps_the_stored_kind(self, info: ValidationInfo) -> "AutomationUpdate":
@@ -613,7 +638,6 @@ class AutomationResponse(BaseModel):
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
 
-    agent_mode: str
     instruction: str
     workspace_id: Optional[UUID] = None
     llm_model: Optional[str] = None
@@ -651,7 +675,6 @@ class AutomationRunResponse(AutomationExecutionResponse):
     """An execution with its automation's identity."""
 
     automation_name: str
-    agent_mode: str
     trigger_type: str
     workspace_id: Optional[UUID] = None
 

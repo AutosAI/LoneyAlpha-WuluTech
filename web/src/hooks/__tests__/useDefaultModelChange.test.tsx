@@ -11,7 +11,7 @@ import { useDefaultModelChange } from '../useDefaultModelChange';
 
 const mocks = vi.hoisted(() => ({
   preferences: null as unknown,
-  systemDefaults: { default_model: 'deploy-default', flash_model: 'deploy-flash' } as Record<string, string> | null,
+  systemDefaults: { default_model: 'deploy-default', background_model: 'deploy-background' } as Record<string, string> | null,
   put: vi.fn(),
   toast: vi.fn(),
 }));
@@ -54,7 +54,7 @@ async function confirm(result: View, applyTo: 'new_threads' | 'existing_threads'
 describe('useDefaultModelChange', () => {
   beforeEach(() => {
     mocks.preferences = { model_preference: { preferred_model: 'model-old' } };
-    mocks.systemDefaults = { default_model: 'deploy-default', flash_model: 'deploy-flash' };
+    mocks.systemDefaults = { default_model: 'deploy-default', background_model: 'deploy-background' };
     mocks.put.mockReset();
     mocks.put.mockResolvedValue({});
     mocks.toast.mockReset();
@@ -62,9 +62,9 @@ describe('useDefaultModelChange', () => {
 
   it('asks when no answer is saved, and writes nothing until it is answered', () => {
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
 
-    expect(result.current.draft).toEqual({ ptc: 'model-new' });
+    expect(result.current.draft).toEqual({ default: 'model-new' });
     expect(result.current.question).toMatchObject({
       models: ['label:model-new'],
       previous: ['label:model-old'],
@@ -81,7 +81,7 @@ describe('useDefaultModelChange', () => {
   it('saves a remembered answer in the same write as the default', async () => {
     mocks.put.mockResolvedValue({ threads_reassigned: 2 });
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
     await confirm(result, 'existing_threads', true);
 
     await waitFor(() => expect(result.current.question).toBeNull());
@@ -94,7 +94,7 @@ describe('useDefaultModelChange', () => {
 
   it('sends a one-time answer without saving it', async () => {
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
     await confirm(result, 'new_threads', false);
 
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
@@ -112,7 +112,7 @@ describe('useDefaultModelChange', () => {
     };
     mocks.put.mockResolvedValue({ threads_reassigned: 1 });
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
 
     expect(result.current.question).toBeNull();
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
@@ -124,31 +124,31 @@ describe('useDefaultModelChange', () => {
     });
   });
 
-  it('writes the flash default from a fast composer, measured against the flash it replaces', async () => {
+  it('writes the Background default from the background slot, measured against the one it replaces', async () => {
     mocks.preferences = {
       model_preference: { preferred_model: 'model-old', default_model_scope: 'existing_threads' },
     };
     mocks.put.mockResolvedValue({ threads_reassigned: 0 });
     const { result } = setup();
-    act(() => { result.current.request({ fast: 'model-quick' }); });
+    act(() => { result.current.request({ background: 'model-quick' }); });
 
-    // Fast falls through to the primary before the deployment's flash model.
+    // Fast falls through to the primary before the deployment's Background model.
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
       description: 'Default set to label:model-quick. No threads were using label:model-old.',
     }));
     expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_flash_model: 'model-quick', flash_follows: null },
+      model_preference: { preferred_background_model: 'model-quick', background_follows: null },
       apply_default_to: 'existing_threads',
     });
   });
 
   it('does not ask about a model the default already resolves to', async () => {
     const { result } = setup();
-    act(() => { result.current.request({ fast: 'model-old' }); });
+    act(() => { result.current.request({ background: 'model-old' }); });
 
     expect(result.current.question).toBeNull();
     await waitFor(() => expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_flash_model: 'model-old', flash_follows: null },
+      model_preference: { preferred_background_model: 'model-old', background_follows: null },
       apply_default_to: 'new_threads',
     }));
   });
@@ -156,10 +156,10 @@ describe('useDefaultModelChange', () => {
   it('joins a second pick to the open question instead of dropping the first', async () => {
     mocks.put.mockResolvedValue({ threads_reassigned: 3 });
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new', fast: 'model-fill' }); });
-    act(() => { result.current.request({ fast: 'model-quick' }); });
+    act(() => { result.current.request({ default: 'model-new', background: 'model-fill' }); });
+    act(() => { result.current.request({ background: 'model-quick' }); });
 
-    expect(result.current.draft).toEqual({ ptc: 'model-new', fast: 'model-quick' });
+    expect(result.current.draft).toEqual({ default: 'model-new', background: 'model-quick' });
     expect(result.current.question).toMatchObject({
       models: ['label:model-new', 'label:model-quick'],
       previous: ['label:model-old'],
@@ -171,34 +171,34 @@ describe('useDefaultModelChange', () => {
       description: 'Defaults set to label:model-new and label:model-quick. 3 threads switched.',
     }));
     expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_model: 'model-new', preferred_flash_model: 'model-quick', flash_follows: null },
+      model_preference: { preferred_model: 'model-new', preferred_background_model: 'model-quick', background_follows: null },
       apply_default_to: 'existing_threads',
     });
   });
 
   it('names a draft that changes nothing once, even when both defaults name the same model', async () => {
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
-    act(() => { result.current.request({ fast: 'model-quick' }); });
-    act(() => { result.current.request({ ptc: 'model-old' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
+    act(() => { result.current.request({ background: 'model-quick' }); });
+    act(() => { result.current.request({ default: 'model-old' }); });
     // Both now resolve to what they already were, so the draft applies as is.
-    act(() => { result.current.request({ fast: 'model-old' }); });
+    act(() => { result.current.request({ background: 'model-old' }); });
 
     await waitFor(() => expect(result.current.question).toBeNull());
     expect(mocks.toast).toHaveBeenCalledWith({ description: 'Default set to label:model-old for new threads.' });
     expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_model: 'model-old', preferred_flash_model: 'model-old', flash_follows: null },
+      model_preference: { preferred_model: 'model-old', preferred_background_model: 'model-old', background_follows: null },
       apply_default_to: 'new_threads',
     });
   });
 
   it('drops the whole draft on cancel', () => {
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new', fast: 'model-fill' }); });
+    act(() => { result.current.request({ default: 'model-new', background: 'model-fill' }); });
     act(() => { result.current.question!.onCancel(); });
-    act(() => { result.current.request({ fast: 'model-quick' }); });
+    act(() => { result.current.request({ background: 'model-quick' }); });
 
-    expect(result.current.draft).toEqual({ fast: 'model-quick' });
+    expect(result.current.draft).toEqual({ background: 'model-quick' });
     expect(result.current.question).toMatchObject({ models: ['label:model-quick'], previous: ['label:model-old'] });
   });
 
@@ -206,44 +206,44 @@ describe('useDefaultModelChange', () => {
     let answer!: (value: Record<string, unknown>) => void;
     mocks.put.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
     await confirm(result, 'new_threads', false);
     await waitFor(() => expect(result.current.saving).toBe(true));
     expect(result.current.question?.saving).toBe(true);
 
-    act(() => { result.current.request({ fast: 'model-quick' }); });
+    act(() => { result.current.request({ background: 'model-quick' }); });
     await act(async () => { answer({}); });
 
     await waitFor(() => expect(result.current.saving).toBe(false));
     expect(mocks.toast).toHaveBeenCalledWith({ description: 'Default set to label:model-new for new threads.' });
-    expect(result.current.draft).toEqual({ ptc: 'model-new', fast: 'model-quick' });
+    expect(result.current.draft).toEqual({ default: 'model-new', background: 'model-quick' });
     expect(result.current.question).not.toBeNull();
   });
 
   it('clears a default without asking, and takes it out of the draft', async () => {
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new', fast: 'model-fill' }); });
-    act(() => { result.current.clear('ptc'); });
+    act(() => { result.current.request({ default: 'model-new', background: 'model-fill' }); });
+    act(() => { result.current.clear('default'); });
 
     await waitFor(() => expect(mocks.put).toHaveBeenCalledWith({ model_preference: { preferred_model: null } }));
-    expect(result.current.draft).toEqual({ fast: 'model-fill' });
+    expect(result.current.draft).toEqual({ background: 'model-fill' });
     expect(result.current.question).toMatchObject({ models: ['label:model-fill'], previous: ['label:model-old'] });
 
-    act(() => { result.current.clear('fast'); });
+    act(() => { result.current.clear('background'); });
     expect(result.current.draft).toBeNull();
     expect(result.current.question).toBeNull();
     await waitFor(() => expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_flash_model: null, flash_follows: null },
+      model_preference: { preferred_background_model: null, background_follows: null },
     }));
     expect(mocks.toast).not.toHaveBeenCalled();
   });
 
-  it('writes Auto for flash as following the deployment, without asking', async () => {
+  it('writes Auto for the Background model as following the deployment, without asking', async () => {
     const { result } = setup();
-    act(() => { result.current.clear('fast', 'deployment'); });
+    act(() => { result.current.clear('background', 'deployment'); });
 
     await waitFor(() => expect(mocks.put).toHaveBeenCalledWith({
-      model_preference: { preferred_flash_model: null, flash_follows: 'deployment' },
+      model_preference: { preferred_background_model: null, background_follows: 'deployment' },
     }));
     expect(result.current.question).toBeNull();
   });
@@ -251,7 +251,7 @@ describe('useDefaultModelChange', () => {
   it('keeps the question open when the write fails', async () => {
     mocks.put.mockRejectedValue(new Error('offline'));
     const { result } = setup();
-    act(() => { result.current.request({ ptc: 'model-new' }); });
+    act(() => { result.current.request({ default: 'model-new' }); });
     await confirm(result, 'existing_threads', false);
 
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({

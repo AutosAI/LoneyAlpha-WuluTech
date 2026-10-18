@@ -52,7 +52,7 @@ vi.mock('@/hooks/useAllModels', () => ({
     catalogModelNames: new Set<string>(),
     metadata: {},
     isLoading: false,
-    systemDefaults: { default_model: 'model-default', flash_model: '' },
+    systemDefaults: { default_model: 'model-default', background_model: '' },
   }),
 }));
 
@@ -101,7 +101,7 @@ const failure = () => Object.assign(new Error('400'), { response: { status: 400 
  *  composer is controlled by it, and the fallback pill's switch is a pick
  *  that clears the suggestion once saved. */
 function Host({ threadId, onSend }: { threadId: string; onSend: (...args: unknown[]) => void }) {
-  const threadModel = useThreadModel({ threadId, mode: 'ptc', isLoading: false });
+  const threadModel = useThreadModel({ threadId, isLoading: false });
   const [suggestion, setSuggestion] = useState<FallbackSuggestion | null>(SUGGESTION);
   const { pickModel } = threadModel;
   return (
@@ -113,7 +113,7 @@ function Host({ threadId, onSend }: { threadId: string; onSend: (...args: unknow
         onSwitchModel={(model) => { void pickModel(model).then((ok) => { if (ok) setSuggestion(null); }); }}
         onDismiss={() => setSuggestion(null)}
       />
-      <ChatInput model={threadModel.model} onPickModel={pickModel} onSend={onSend} mode="ptc" />
+      <ChatInput model={threadModel.model} onPickModel={pickModel} onSend={onSend} />
     </>
   );
 }

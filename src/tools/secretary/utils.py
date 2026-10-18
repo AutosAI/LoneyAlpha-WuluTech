@@ -41,8 +41,8 @@ _RUN_STATUS = {
 # like files. Every extension the client's own tables name as one belongs here
 # -- `filePaths.KIND_BY_EXT` (what a deliverable card can show) and
 # `filePanel/fileMeta` (what the panel lists and offers to download) -- because
-# a deliverable that relays unqualified resolves against the Flash workspace,
-# which holds none of these files.
+# a deliverable that relays unqualified resolves against Home, which holds
+# none of these files.
 _FILE_EXTS = (
     r"md|markdown|txt|pdf|doc|docx|odt|rtf|"
     r"py|js|jsx|ts|tsx|html|htm|css|sh|bash|sql|r|rb|go|rs|java|ipynb|pptx|ppt|key|"
@@ -77,7 +77,7 @@ _WSREF_PREFIX = "__wsref__"
 # destination stops as early as it can and the title rides in the closing group,
 # which `_rewrite` already emits untouched. Left unqualified, a titled link is
 # not safely ignored the way a URL is -- the parser hands the client the bare
-# path, which then resolves against the Flash workspace and opens nothing.
+# path, which then resolves against Home and opens nothing.
 _DEST = r"<[^<>\n]+>|(?:[^()<>\n]|\([^()<>\n]*\))+?"
 _TITLE = r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?"""
 _MD_LINK_RE = re.compile(r"(!?\[[^\]\n]{0,512}\]\()(" + _DEST + r")(" + _TITLE + r"\))")
@@ -135,7 +135,7 @@ _FILE_NAME_RE = re.compile(r"\.(?:" + _FILE_EXTS + r")$", re.IGNORECASE)
 # every URL reader on the client uses too (react-markdown's `defaultUrlTransform`
 # and `hast-util-sanitize`). Rejecting every colon also rejected
 # `results/Q3:final.pdf`, a name the sandbox allows and the resolver accepts, so
-# the link relayed unqualified and opened nothing in the Flash workspace.
+# the link relayed unqualified and opened nothing in Home.
 _SCHEME_RE = re.compile(r"^[^/]*:")
 
 
@@ -175,11 +175,11 @@ def _qualify_file_paths(text: str, workspace_id: str) -> str:
         [model](./model.py:42)        → [model](__wsref__/{wid}/model.py:42)
         [deck](<t/Q3 deck.pptx>) → [deck](<__wsref__/{wid}/t/Q3 deck.pptx>)
 
-    The relayed text renders in the Flash thread, whose own workspace holds none
-    of these files, so every relative file link has to carry where it lives,
-    bare names included. A path-based prefix survives HTML sanitizers that strip
-    unknown protocols. URLs, in-page anchors, paths outside the workspace and
-    already-qualified links are left as written.
+    The relayed text renders in Home, which holds none of these files, so
+    every relative file link has to carry where it lives, bare names included.
+    A path-based prefix survives HTML sanitizers that strip unknown protocols.
+    URLs, in-page anchors, paths outside the workspace and already-qualified
+    links are left as written.
     """
     if not workspace_id or not text:
         return text
@@ -301,8 +301,7 @@ async def extract_text_from_thread(
     """Extract the text each run of a thread committed, one labeled block per run.
 
     Reads from Redis if the thread is actively running, otherwise reads
-    from the database: each settled run's text comes from its turn slice,
-    falling back to the main lane of its stored events.
+    from the database: each settled run's text comes from its turn slice.
 
     Args:
         thread_id: The conversation thread ID
@@ -343,7 +342,7 @@ async def extract_text_from_thread(
     else:
         status = thread.get("current_status", "unknown")
 
-    # Qualify relative file paths with workspace context so the flash agent
+    # Qualify relative file paths with workspace context so the Chief of Staff
     # (and its frontend) can resolve them across workspaces, then cap length.
     if active_run is not None:
         # The active stream is always a single live turn — read the ledger
@@ -464,33 +463,11 @@ async def _extract_from_redis(thread_id: str, run_id: str) -> str:
     return "".join(chunks)
 
 
-def _text_from_response(response: dict[str, Any]) -> str:
-    """The fallback text of one turn: its stored main-lane ``message_chunk`` events."""
-    chunks: list[str] = []
-    for event in response.get("sse_events") or []:
-        if not isinstance(event, dict):
-            continue
-        if event.get("event") != "message_chunk":
-            continue
-        data = event.get("data", {})
-        if not isinstance(data, dict):
-            continue
-        agent = data.get("agent")
-        if isinstance(agent, str) and agent.startswith("task:"):
-            continue  # a subagent lane, not what the main agent said
-        if data.get("content_type") == "text":
-            content = data.get("content", "")
-            if content:
-                chunks.append(content)
-    return "".join(chunks)
-
-
 async def _with_main_text(
     thread_id: str, runs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Copies of ``runs`` each carrying ``main_text``, what the turn committed
-    (``committed_texts``). A run that has no slice to read falls back to its
-    stored events' main lane, read for those runs alone."""
+    (``committed_texts``). A run with no committed text to read has none."""
     if not runs:
         return []
     # Local import: this module loads at agent import time.
@@ -500,30 +477,10 @@ async def _with_main_text(
         thread_id,
         {str(run["conversation_response_id"]): run.get("turn_index") for run in runs},
     )
-    events = await _stored_events_of(
-        [
-            response_id
-            for run in runs
-            if (response_id := str(run["conversation_response_id"])) not in texts
-        ]
-    )
-    out: list[dict[str, Any]] = []
-    for run in runs:
-        response_id = str(run["conversation_response_id"])
-        text = texts.get(response_id)
-        if text is None:
-            text = _text_from_response({"sse_events": events.get(response_id)})
-        out.append({**run, "main_text": text})
-    return out
-
-
-async def _stored_events_of(response_ids: list[str]) -> dict[str, Any]:
-    if not response_ids:
-        return {}
-    from src.server.database.conversation.replay_rows import get_replay_responses
-
-    rows = await get_replay_responses(response_ids)
-    return {response_id: row.get("sse_events") for response_id, row in rows.items()}
+    return [
+        {**run, "main_text": texts.get(str(run["conversation_response_id"]), "")}
+        for run in runs
+    ]
 
 
 async def _runs_to_read(thread_id: str, turns: int = 1) -> list[dict[str, Any]]:

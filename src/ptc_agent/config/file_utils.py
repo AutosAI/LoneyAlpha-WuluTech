@@ -206,6 +206,18 @@ def _deep_merge(base: Any, overlay: Any) -> Any:
     return merged
 
 
+def refuse_renamed_llm_keys(config: Any, source: str | Path) -> None:
+    """Fail on ``llm.flash``, the Background model's name before ``llm.background``.
+
+    Read as an unknown key it would be ignored, and the Background model would
+    quietly become the main one, so a file still on it stops the load instead.
+    Run on each file, so the error names the one to fix.
+    """
+    llm = config.get("llm") if isinstance(config, dict) else None
+    if isinstance(llm, dict) and "flash" in llm:
+        raise ValueError(f"llm.flash was renamed to llm.background (in {source})")
+
+
 def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
     """Load and process YAML configuration file with env var substitution.
 
@@ -224,6 +236,7 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
         return _config_cache[cache_key]
 
     raw_config = _read_yaml(file_path)
+    refuse_renamed_llm_keys(raw_config, file_path)
 
     if app_env:
         base = Path(file_path)
@@ -232,6 +245,7 @@ def load_yaml_config(file_path: str, use_cache: bool = True) -> dict[str, Any]:
             overlay_config = _read_yaml(overlay)
             if not isinstance(overlay_config, dict):
                 raise ValueError(f"{overlay} must be a mapping of config keys")
+            refuse_renamed_llm_keys(overlay_config, overlay)
             raw_config = _deep_merge(raw_config, overlay_config)
             logger.info(f"Applied {overlay.name} over {file_path}")
         else:

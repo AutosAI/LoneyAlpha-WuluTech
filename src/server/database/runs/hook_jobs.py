@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, NotRequired, Optional, TypedDict
 
 from src.server.contracts.status import to_public
+from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
 
 
 
@@ -74,11 +75,10 @@ def build_finalize_jobs(
     *,
     run_id: str,
     thread_id: str,
-    msg_type: str,
     user_id: Optional[str] = None,
     burst_slot_id: Optional[str] = None,
     report_back_ptc_thread_id: Optional[str] = None,
-    origin_flash_thread_id: Optional[str] = None,
+    dispatcher_thread_id: Optional[str] = None,
     origin_dispatch_gen: Optional[str] = None,
     workspace_id: Optional[str] = None,
     run_seq: Optional[int] = None,
@@ -92,19 +92,19 @@ def build_finalize_jobs(
     Returned callable is invoked inside the finalize transaction with the
     CAS-adopted final status (a durable cancel may have overridden the
     requested one). One ordering rule: every report-back-lifecycle job keys
-    on the WATCHING flash thread (START-stamped ``origin_flash_thread_id``;
-    a report-back flash run IS that thread, so its own ``thread_id`` lands
-    in the same chain) — all completions reporting into one flash thread
-    serialize strictly, across any number of drainer workers, and a
-    completed run's report_back can never be overtaken by a later
-    watch_clear. Runs without a flash origin fall back to their own
-    thread_id. Pure and synchronous — it runs inside the finalize
-    transaction and must not do I/O.
+    on the WATCHING Chief of Staff thread (``dispatcher_thread_id``, from
+    the START-stamped ``ORIGIN_THREAD_META``; a report-back run IS that
+    thread, so its own ``thread_id`` lands in the same chain): all
+    completions reporting into one Chief of Staff thread serialize strictly,
+    across any number of drainer workers, and a completed run's report_back
+    can never be overtaken by a later watch_clear. Runs without a dispatching
+    thread fall back to their own thread_id. Pure and synchronous — it runs
+    inside the finalize transaction and must not do I/O.
     """
 
     def _jobs(final_status: str) -> List[HookJob]:
         jobs: List[HookJob] = []
-        okey = origin_flash_thread_id or thread_id
+        okey = dispatcher_thread_id or thread_id
 
         if user_id:
             # Every settle owed to a known owner publishes to their feed —
@@ -169,9 +169,7 @@ def build_finalize_jobs(
             # failed or stopped one wakes the watcher so the card reconciles.
             # An interrupted summary is waiting on the user, not over: the
             # next turn on its thread takes the pair over and owes the
-            # release instead (see ``carried_pair``). It may run on either
-            # agent: Home answers it when the user has the all-workspaces
-            # agent.
+            # release instead (see ``carried_pair``).
             if final_status != "interrupted":
                 jobs.append(
                     HookJob(
@@ -186,35 +184,31 @@ def build_finalize_jobs(
                         ordering_key=okey,
                     )
                 )
-        elif msg_type == "ptc":
-            if final_status == "interrupted":
-                jobs.append(
-                    HookJob(
-                        hook_type="needs_input_wake",
-                        idempotency_key=f"{run_id}:needs_input_wake",
-                        payload=NeedsInputWakePayload(ptc_thread_id=thread_id),
-                        ordering_key=okey,
-                    )
+        elif final_status == "interrupted":
+            jobs.append(
+                HookJob(
+                    hook_type="needs_input_wake",
+                    idempotency_key=f"{run_id}:needs_input_wake",
+                    payload=NeedsInputWakePayload(ptc_thread_id=thread_id),
+                    ordering_key=okey,
                 )
-            else:
-                # A stop or a failure is reported like a result: the watching
-                # thread told the user a report was coming, and a card alone
-                # would leave that promise to be found by scrolling.
-                jobs.append(
-                    HookJob(
-                        hook_type="report_back",
-                        idempotency_key=f"{run_id}:report_back",
-                        payload=ReportBackPayload(
-                            ptc_thread_id=thread_id,
-                            dispatch_gen=origin_dispatch_gen,
-                            final_status=final_status,
-                        ),
-                        ordering_key=okey,
-                    )
+            )
+        else:
+            # A stop or a failure is reported like a result: the watching
+            # thread told the user a report was coming, and a card alone
+            # would leave that promise to be found by scrolling.
+            jobs.append(
+                HookJob(
+                    hook_type="report_back",
+                    idempotency_key=f"{run_id}:report_back",
+                    payload=ReportBackPayload(
+                        ptc_thread_id=thread_id,
+                        dispatch_gen=origin_dispatch_gen,
+                        final_status=final_status,
+                    ),
+                    ordering_key=okey,
                 )
-        # Any other run is a Flash turn outside a report-back and owes
-        # neither: a pair is keyed on the dispatched PTC thread, never on a
-        # Flash one.
+            )
         return jobs
 
     return _jobs
@@ -230,11 +224,10 @@ def build_finalize_jobs_from_run_row(
     return build_finalize_jobs(
         run_id=str(run["conversation_response_id"]),
         thread_id=str(run["conversation_thread_id"]),
-        msg_type=meta.get("msg_type") or "ptc",
         user_id=meta.get("user_id"),
         burst_slot_id=meta.get("burst_slot_id"),
         report_back_ptc_thread_id=meta.get("report_back_ptc_thread_id"),
-        origin_flash_thread_id=meta.get("origin_flash_thread_id"),
+        dispatcher_thread_id=meta.get(ORIGIN_THREAD_META),
         origin_dispatch_gen=meta.get("origin_dispatch_gen"),
         workspace_id=meta.get("workspace_id"),
         run_seq=run.get("run_seq"),

@@ -1,10 +1,9 @@
 /**
  * What a card says about the machine underneath it.
  *
- * The rows are the live wt3 ones: three projects on computer 5319ad0e, each
- * with its own `dir_name`, plus the flash workspace that belongs to no
- * machine. The card's state has to come from the computer, because that is
- * what starts and stops.
+ * The rows are the live wt3 ones: two workspaces on computer 5319ad0e, each
+ * with its own `dir_name`. The card's state has to come from the computer,
+ * because that is what starts and stops.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
@@ -20,6 +19,7 @@ const WORKSPACES: Workspace[] = [
     workspace_id: 'aecc944a-61b4-4e68-8a1d-28e1b1823001',
     name: 'Live Alpha',
     status: 'running',
+    is_home: false,
     computer_id: COMPUTER_ID,
     dir_name: 'live-alpha-16ad',
     resource_tier: 'standard',
@@ -29,6 +29,7 @@ const WORKSPACES: Workspace[] = [
     workspace_id: '01dae5b9-edb4-4afb-966e-920039c6d0ac',
     name: 'Live Beta',
     status: 'running',
+    is_home: false,
     computer_id: COMPUTER_ID,
     dir_name: 'live-beta-1d6d',
     resource_tier: 'standard',
@@ -46,7 +47,7 @@ vi.mock('@/hooks/useWorkspaces', () => ({
 
 vi.mock('../../utils/api', () => ({
   createWorkspace: vi.fn(),
-  getFlashWorkspace: vi.fn(async () => null),
+  getHomeWorkspace: vi.fn(async () => null),
   reorderWorkspaces: vi.fn(),
   renameWorkspace: vi.fn(),
   getComputers: vi.fn(),
@@ -112,12 +113,12 @@ beforeEach(() => {
 });
 
 describe('WorkspaceCard, machine line', () => {
-  it('asks the paginated server list to preserve Flash custom ordering', async () => {
+  it('asks the paginated server list to include Home in its custom ordering', async () => {
     renderWithProviders(<WorkspaceGallery onWorkspaceSelect={vi.fn()} />);
 
     await screen.findAllByTestId('workspace-card');
     expect(mockUseWorkspaces).toHaveBeenCalledWith(expect.objectContaining({
-      includeFlash: true,
+      includeHome: true,
       offset: 0,
     }));
   });

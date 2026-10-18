@@ -30,6 +30,7 @@ from src.server.utils.error_sanitization import (
 from src.server.utils.http_headers import content_disposition
 from fastapi.responses import Response, StreamingResponse
 
+from src.server.database.home_workspace import is_unbound
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.persistence.file import FilePersistenceService
@@ -78,8 +79,9 @@ from ._shared import (
     previous_dir_names_of,
     _is_always_hidden_path,
     _is_binary,
-    _is_flash_workspace,
+    HOME_NOT_ON_COMPUTER_REASON,
     _is_hidden_path,
+    owned_workspace_on_computer,
     _is_system_path,
     _normalize_requested_path,
     _record_fs_bytes,
@@ -177,8 +179,8 @@ async def list_workspace_files(
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=x_user_id)
 
-    if _is_flash_workspace(workspace):
-        return {"files": [], "sandbox_ready": False, "flash_workspace": True}
+    if is_unbound(workspace):
+        return {"files": [], "sandbox_ready": False, "reason": HOME_NOT_ON_COMPUTER_REASON}
 
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
@@ -339,8 +341,8 @@ async def resolve_workspace_file(
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=x_user_id)
 
-    if _is_flash_workspace(workspace):
-        return {"status": "unavailable", "reason": "flash_workspace", "matches": []}
+    if is_unbound(workspace):
+        return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
 
     work_dir, candidates, recent_writes = _folded_refs(body, workspace)
     if not candidates:
@@ -417,13 +419,7 @@ async def read_workspace_file(
 ) -> dict[str, Any]:
     """Read a file from the workspace's sandbox, or from DB if stopped."""
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     # Virtual DB-backed JSON files (user profile, automations) are served from
     # the DB, independent of sandbox state. Works whether the workspace is
@@ -569,13 +565,7 @@ async def write_workspace_file(
 ) -> dict[str, Any]:
     """Write text content to a file in the workspace's sandbox."""
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -732,13 +722,7 @@ async def download_workspace_file(
     """Download raw bytes from the workspace's sandbox, or from DB if stopped."""
     disposition = "attachment" if attachment else "inline"
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     work_dir = owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
@@ -896,12 +880,7 @@ async def workspace_file_download_url(
     disk. The link skips secret redaction: it is the owner's own file, and
     redacting would mean carrying the bytes through this process.
     """
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     layout = owner_layout(workspace)
     work_dir = layout.workspace
@@ -955,13 +934,7 @@ async def upload_workspace_file(
 ) -> dict[str, Any]:
     """Upload a file to the workspace's live sandbox."""
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -1021,13 +994,7 @@ async def backup_workspace_files(
 ) -> dict[str, Any]:
     """Backup workspace files from sandbox to DB for offline access."""
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -1094,7 +1061,7 @@ async def get_backup_status(
         "files_restore_incomplete": restore_incomplete,
     }
 
-    if _is_flash_workspace(workspace):
+    if is_unbound(workspace):
         return empty
 
     from src.server.database.workspace_file import (
@@ -1184,13 +1151,7 @@ async def delete_workspace_files(
 ) -> dict[str, Any]:
     """Delete one or more files from the workspace's live sandbox."""
 
-    workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
-
-    if _is_flash_workspace(workspace):
-        raise HTTPException(
-            status_code=400, detail="Flash workspaces do not have a sandbox"
-        )
+    workspace = await owned_workspace_on_computer(workspace_id, x_user_id)
 
     if served_from_mirror(workspace.get("status")):
         raise HTTPException(
@@ -1209,15 +1170,26 @@ async def delete_workspace_files(
         # and a probe apiece is a hundred sandbox round trips for one click.
         probe_slot: dict[int, int] = {}
         candidates: list[str] = []
+        undeletable: dict[int, str] = {}
         for index, path in enumerate(body.paths):
             candidate = contained_absolute_path(path, work_dir, previous_dirs)
             if candidate is None or not sandbox.validate_path(candidate):
+                continue
+            # A server-held file is refused for what it is, before the probe:
+            # with the file mount down its link resolves to nothing, and the
+            # file the panel lists would read as not found.
+            virtual = _virtual_file(_to_client_path(sandbox, candidate, work_dir))
+            if virtual:
+                undeletable[index] = virtual.undeletable
                 continue
             probe_slot[index] = len(candidates)
             candidates.append(candidate)
         canonicals = await contained_sandbox_paths(sandbox, candidates, work_dir=work_dir)
 
         for index, path in enumerate(body.paths):
+            if index in undeletable:
+                errors.append({"path": path, "detail": undeletable[index]})
+                continue
             slot = probe_slot.get(index)
             normalized = canonicals[slot] if slot is not None else None
             if normalized is None:
@@ -1226,10 +1198,6 @@ async def delete_workspace_files(
 
             addressed = candidates[slot]
             client_path = _to_client_path(sandbox, addressed, work_dir)
-            virtual = _virtual_file(client_path)
-            if virtual:
-                errors.append({"path": path, "detail": virtual.undeletable})
-                continue
             if _is_system_path(client_path):
                 errors.append({"path": path, "detail": "Cannot delete system files"})
                 continue

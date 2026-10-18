@@ -38,7 +38,8 @@ import {
 import {
   isSubagentEvent, handleSubagentMessageChunk, handleSubagentToolCallChunks,
   handleSubagentToolCalls, handleSubagentToolCallResult, handleTaskSteeringAccepted,
-  handleWorkflowLifecycle, pushTaskNotice, returnTaskInstruction, type DeliveredInstruction,
+  handleWorkflowLifecycle, pushTaskNotice, returnTaskInstruction, returnedTaskInstruction,
+  type DeliveredInstruction,
 } from '../subagents/liveEventHandlers';
 import { getOrCreateTaskRefs, type UpdateSubagentCard } from '../streamRefs';
 import { handleMarketWatchUpdate, type MarketWatchState } from '../marketWatchEvents';
@@ -60,7 +61,7 @@ export interface StreamRouterDeps {
   attachSubagentMux: (tid: string, processEvent: (event: SSEEvent) => void, snapshotAtMs?: number) => void;
   setMarketWatch: React.Dispatch<React.SetStateAction<MarketWatchState | null>>;
   /** Re-read the workspace row, whose folder a run's sandbox acquisition may
-   * have moved; null where a run acquires none (flash). */
+   * have moved; null with no workspace. */
   refreshWorkspaceFolder: (() => void) | null;
   /** Watch this thread for a hand-off's report-back. */
   armReportBack: () => void;
@@ -427,21 +428,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       return;
     }
 
-    // Handle steering_returned for the MAIN agent — it finished before
-    // consuming the steering message. Remove the steering user message from
-    // chat and restore text to input box. Task-lane steering_returned is
+    // A main-thread steering_returned hands a chat app's missed steers back
+    // to the gateway that resubmits them; a steer this view sent stays on the
+    // server and its next turn reads it. Task-lane steering_returned is
     // handled in the isSubagent block (it must not mutate main-chat state).
-    if (eventType === 'steering_returned' && !isSubagent) {
-      const returnedMessages = event.messages || [];
-      if (returnedMessages.length > 0) {
-        // Remove steering user messages from the chat
-        rt.setMessages((prev) => prev.filter((msg) => !('steering' in msg && msg.steering)));
-        // Restore the text to the input box via state
-        const combinedText = returnedMessages.map((m) => m.content).join('\n');
-        rt.setReturnedSteering(combinedText);
-      }
-      return;
-    }
+    if (eventType === 'steering_returned' && !isSubagent) return;
 
     // Handle unified context_window events (token_usage, summarize, offload)
     if (eventType === 'context_window') {
@@ -682,19 +673,12 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           }
         } else if (eventType === 'steering_returned') {
           // Run ended before the task steering was delivered — surface the
-          // returned text in the task transcript. Producers emit the text as
-          // top-level content; messages[] is a defensive fallback only.
-          const returnedContent = ((event.content as string) || '')
-            || ((event.messages || []) as Array<{ content?: string }>)
-              .map((m) => m.content || '').filter(Boolean).join('\n');
-          if (returnedContent) {
+          // returned text in the task transcript.
+          const returned = returnedTaskInstruction(event);
+          if (returned) {
             // The notice goes up whether or not a bubble here was pending: the
             // frame is the server's word, and another tab may have sent it.
-            returnTaskInstruction(
-              taskRefs,
-              { inputId: event.input_id as string | undefined, content: returnedContent },
-              rt.t('chat.taskSteeringReturnedNotification'),
-            );
+            returnTaskInstruction(taskRefs, returned, rt.t('chat.taskSteeringReturnedNotification'));
             rt.updateSubagentCard(taskId, { messages: taskRefs.messages });
           }
         } else if (eventType === 'error' || event.error) {

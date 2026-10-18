@@ -19,7 +19,7 @@ from ptc_agent.config.agent import CredentialSource
 from tests.conftest import create_test_app
 
 THREADS_MOD = "src.server.app.threads.messaging"
-RESERVE_MOD = "src.server.services.report_back.flash.reserve"
+RESERVE_MOD = "src.server.services.report_back.handoff.reserve"
 
 USER = "usr-dispatch-001"
 TOKEN = "test-internal-service-token"
@@ -27,7 +27,6 @@ TOKEN = "test-internal-service-token"
 _BODY = {
     "workspace_id": "ws-placeholder",
     "messages": [{"role": "user", "content": "test query"}],
-    "agent_mode": "ptc",
 }
 
 
@@ -106,7 +105,13 @@ def _stub_workflow(release_burst=None, admit=None):
         ),
         patch(
             "src.server.database.workspace.get_workspace",
-            new=AsyncMock(return_value={"user_id": USER, "status": "running"}),
+            new=AsyncMock(
+                return_value={
+                    "workspace_id": "ws-placeholder",
+                    "user_id": USER,
+                    "status": "running",
+                }
+            ),
         ),
         patch.object(setup_module, "agent_config", MagicMock()),
         patch(
@@ -266,7 +271,7 @@ async def test_refused_admission_gate_aborts_dispatch(monkeypatch):
             app,
             body={
                 **_BODY,
-                "origin_flash_thread_id": "flash-1",
+                "origin_home_thread_id": "cos-1",
                 "origin_dispatch_gen": "g-1",
             },
             headers={"X-Dispatch": "background", "X-Service-Token": TOKEN},
@@ -292,7 +297,7 @@ async def test_dispatch_gen_runs_the_refusal_gate(monkeypatch):
             app,
             body={
                 **_BODY,
-                "origin_flash_thread_id": "flash-1",
+                "origin_home_thread_id": "cos-1",
                 "origin_dispatch_gen": "g-1",
             },
             headers={"X-Dispatch": "background", "X-Service-Token": TOKEN},
@@ -345,7 +350,7 @@ async def test_priming_failure_retracts_intent_stamp(
             app,
             body={
                 **_BODY,
-                "origin_flash_thread_id": "flash-1",
+                "origin_home_thread_id": "cos-1",
                 "origin_dispatch_gen": "g-1",
             },
             headers={"X-Dispatch": "background", "X-Service-Token": TOKEN},
@@ -386,7 +391,7 @@ async def test_dispatch_retransmit_race_adopts_existing_run(monkeypatch):
             app,
             body={
                 **_BODY,
-                "origin_flash_thread_id": "flash-1",
+                "origin_home_thread_id": "cos-1",
                 "origin_dispatch_gen": "g-1",
             },
             headers={"X-Dispatch": "background", "X-Service-Token": TOKEN},

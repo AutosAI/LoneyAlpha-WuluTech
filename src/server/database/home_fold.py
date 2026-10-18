@@ -1,8 +1,8 @@
-"""Folding an account's other flash rows into the Home its id derives.
+"""Folding an account's former Home rows into the Home its id derives.
 
-A flash row's id derives from the user id it was made for, so a row only stops
+A Home's id derives from the user id it was made for, so a row only stops
 matching its owner when it changes accounts: an account merge moves an
-account's rows onto the account it joins, its flash row included, under an id
+account's rows onto the account it joins, its Home included, under an id
 derived from the merged account. The account would then list two "All
 workspaces" entries, one holding the merged account's conversations. The fold
 moves what that row holds into Home and retires it, so the history reads as
@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 # Every table keyed by a workspace either moves or stays, and a test reads the
 # schema for any it finds in neither, so a new one gets a decision.
 MOVES: dict[str, str] = {
+    # Before the threads, in this order: a row continues its pinned thread
+    # only where both live, so it moves with the thread wherever it was stored.
+    "automations": """
+        UPDATE automations SET workspace_id = %(home)s
+        WHERE workspace_id = %(former)s OR conversation_thread_id IN (
+            SELECT conversation_thread_id FROM conversation_threads
+            WHERE workspace_id = %(former)s
+        )
+    """,
     # thread_index is unique per workspace, so a row's threads append after
     # Home's in the order they were started. updated_at stays, so the thread
     # list keeps its order.
@@ -47,8 +56,11 @@ MOVES: dict[str, str] = {
         SET workspace_id = %(home)s, thread_index = moved.thread_index
         FROM moved WHERE t.conversation_thread_id = moved.conversation_thread_id
     """,
-    "automations": """
-        UPDATE automations SET workspace_id = %(home)s
+    # A run's place is its thread's workspace, and a usage row outlives its
+    # thread: left on the retired row, a run whose thread is later deleted
+    # would read as some other workspace's.
+    "conversation_usages": """
+        UPDATE conversation_usages SET workspace_id = %(home)s
         WHERE workspace_id = %(former)s
     """,
     # Where Home already holds the same key, Home's stays and the former one
@@ -64,8 +76,6 @@ MOVES: dict[str, str] = {
 }
 
 _SANDBOX = "sandbox state, and a never-bound row has no sandbox"
-_RAN_THERE = "a record of where it ran"
-_NO_SKILL_SCOPE = "nothing offers a flash row skill scope, so it holds none"
 
 STAYS: dict[str, str] = {
     "workspace_files": _SANDBOX,
@@ -73,25 +83,25 @@ STAYS: dict[str, str] = {
     "share_links": _SANDBOX,
     "sandbox_egress_grants": _SANDBOX,
     "sandbox_egress_grant_claims": _SANDBOX,
-    "computers": "origin_workspace_id names the project a sandbox was adopted "
+    "computers": "origin_workspace_id names the workspace a sandbox was adopted "
     "from, and a never-bound row has no sandbox",
     "workspace_mcp_servers": "Home's own MCP selection wins",
     "workspace_mcp_tool_schemas": "cached for the MCP selection, where Home's wins",
     "workspace_vault_secrets": "Home's own secret selection wins",
-    "conversation_usages": _RAN_THERE,
-    "order_attempts": _RAN_THERE,
-    "user_skills": _NO_SKILL_SCOPE,
-    "workspace_skill_disables": _NO_SKILL_SCOPE,
+    "order_attempts": "a record of where it ran",
+    "user_skills": "nothing offers Home as a skill's workspace, so a former Home holds none",
+    "workspace_skill_disables": "Home's own skill selection wins",
+    "user_subagents": "its workspace_id is reserved and always NULL, so a former Home holds none",
 }
 
 _HAS_FORMER = """
     SELECT EXISTS (
         SELECT 1 FROM workspaces
-        WHERE user_id = %s AND status = 'flash' AND workspace_id <> %s
+        WHERE user_id = %s AND status = 'unbound' AND workspace_id <> %s
     ) AS found
 """
 
-# The delete convention: a tombstone, which no longer reads as a flash row.
+# The delete convention: a tombstone, which no longer reads as a Home.
 _RETIRE = """
     UPDATE workspaces SET status = 'deleted', is_pinned = FALSE
     WHERE workspace_id = %(former)s
@@ -99,7 +109,7 @@ _RETIRE = """
 
 
 async def fold_former_homes(user_id: str, home_id: str, conn=None) -> list[str]:
-    """Move the user's other flash rows into ``home_id`` and retire them.
+    """Move the user's former Home rows into ``home_id`` and retire them.
 
     Returns the ids retired. Every Home resolve lands here, so a user with no
     former row costs one unlocked read and no transaction.
@@ -120,7 +130,7 @@ async def fold_former_homes(user_id: str, home_id: str, conn=None) -> list[str]:
             await cur.execute(
                 """
                 SELECT workspace_id FROM workspaces
-                WHERE user_id = %s AND status = 'flash' AND workspace_id <> %s
+                WHERE user_id = %s AND status = 'unbound' AND workspace_id <> %s
                 ORDER BY created_at
                 FOR UPDATE
                 """,

@@ -10,6 +10,7 @@ import hashlib
 import json
 import shlex
 import time
+from secrets import token_hex
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -48,7 +49,6 @@ from ptc_agent.core.sandbox._shared import (
     _hash_dict,
     _internal_package_files,
     _resolve_local_path,
-    _get_sandbox_eligible_skills,
     _resolve_disabled_skills,
 )
 from typing import TYPE_CHECKING
@@ -263,11 +263,12 @@ async def _compute_skills_module(
     skills_base = SandboxLayout(sandbox._work_dir).skills
 
     def build() -> dict[str, Any]:
+        from ptc_agent.agent.middleware.skills import skills_outside_sandbox
         from ptc_agent.agent.middleware.skills.discovery import (
             parse_skill_metadata,
         )
 
-        sandbox_skill_names, all_registry_names = _get_sandbox_eligible_skills()
+        outside_sandbox = skills_outside_sandbox()
 
         files: dict[str, str] = {}  # rel_path → sha256
         skills_metadata: dict[str, dict[str, Any]] = {}
@@ -288,11 +289,8 @@ async def _compute_skills_module(
                 skill_name = skill_dir.name
                 if skill_name in disabled:
                     continue
-                # Skip flash-only skills (not needed in sandbox)
-                if (
-                    skill_name not in sandbox_skill_names
-                    and skill_name in all_registry_names
-                ):
+                # Skip registry skills the sandbox does not get
+                if skill_name in outside_sandbox:
                     continue
 
                 # Later sources override earlier ones
@@ -1103,7 +1101,9 @@ async def _collect_local_skill_names(
     disabled = _resolve_disabled_skills(disabled)
 
     def build() -> set[str]:
-        sandbox_skill_names, all_registry_names = _get_sandbox_eligible_skills()
+        from ptc_agent.agent.middleware.skills import skills_outside_sandbox
+
+        outside_sandbox = skills_outside_sandbox()
 
         names: set[str] = set()
         for root_str in local_skill_roots:
@@ -1116,13 +1116,9 @@ async def _collect_local_skill_names(
                 if not (skill_dir / "SKILL.md").exists():
                     continue
                 skill_name = skill_dir.name
-                # Skip disabled + flash-only skills so they get pruned from sandbox
-                if skill_name in disabled:
-                    continue
-                if (
-                    skill_name not in sandbox_skill_names
-                    and skill_name in all_registry_names
-                ):
+                # Skip disabled skills and registry skills the sandbox does
+                # not get, so they get pruned from it
+                if skill_name in disabled or skill_name in outside_sandbox:
                     continue
                 names.add(skill_name)
         return names
@@ -1262,7 +1258,9 @@ async def _upload_skills(
     Uses a two-pass approach to fix override precedence:
     - Pass 1 (local I/O only): Walk all sources, later sources overwrite earlier
       ones for the same skill_name — each skill appears exactly once.
-    - Pass 2 (sandbox I/O): Single rm, single mkdir, parallel per-skill batch uploads.
+    - Pass 2 (sandbox I/O): single mkdir, parallel per-skill batch uploads
+      into a staging dir, then one exec that swaps each staged dir into place
+      and merges the lock.
 
     Args:
         local_skills_dirs: List of (local_path, sandbox_path) tuples.
@@ -1276,6 +1274,7 @@ async def _upload_skills(
         agent-installed or two-way-synced content occupies them (the caller
         folds these into the module version so the skipped upload retries).
     """
+    from ptc_agent.agent.middleware.skills import skills_outside_sandbox
     from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
 
     disabled = _resolve_disabled_skills(disabled)
@@ -1291,15 +1290,13 @@ async def _upload_skills(
         logger.debug("No skills found; skipping upload")
         return None, set()
 
-    # Skills eligible for sandbox upload (exposure "ptc" or "both")
-    sandbox_skill_names, all_registry_names = _get_sandbox_eligible_skills()
+    outside_sandbox = skills_outside_sandbox()
 
     # ── Pass 1: Planning (local I/O only) ──
     # For each skill, collect files from the *last* source that provides it.
-    # Key: skill_name → (sandbox_skill_dir, list of (local_file, sandbox_dest))
+    # Key: skill_name → list of (local_file, path relative to the skill dir)
     @dataclass
     class _SkillPlan:
-        sandbox_dir: str
         files: list[tuple[Path, str]] = field(default_factory=list)
         subdirs: set[str] = field(default_factory=set)
 
@@ -1323,7 +1320,7 @@ async def _upload_skills(
         ]
 
     def _plan_all() -> None:
-        for local_dir, sandbox_dir in local_skills_dirs:
+        for local_dir, _ in local_skills_dirs:
             local_path = Path(local_dir).expanduser()
             if not local_path.exists():
                 continue
@@ -1332,28 +1329,24 @@ async def _upload_skills(
                 skill_name = skill_dir.name
                 if skill_name in ("", ".", ".."):
                     continue
-                if skill_name in disabled:
-                    continue
-                if (
-                    skill_name not in sandbox_skill_names
-                    and skill_name in all_registry_names
-                ):
+                if skill_name in disabled or skill_name in outside_sandbox:
                     continue
 
-                sandbox_skill_dir = f"{sandbox_dir.rstrip('/')}/{skill_name}"
-                plan = _SkillPlan(sandbox_dir=sandbox_skill_dir)
+                plan = _SkillPlan()
 
                 for fp in _list_skill_files(skill_dir):
                     rel = fp.relative_to(skill_dir)
-                    dest = f"{sandbox_skill_dir}/{rel}"
-                    plan.files.append((fp, dest))
+                    plan.files.append((fp, rel.as_posix()))
                     if len(rel.parts) > 1:
-                        plan.subdirs.add(f"{sandbox_skill_dir}/{rel.parent}")
+                        plan.subdirs.add(rel.parent.as_posix())
 
                 # Later source overwrites earlier for same skill_name
                 final_skills[skill_name] = plan
 
     await asyncio.to_thread(_plan_all)
+    # Every source lands in the one shared folder; planning above already
+    # collapsed a name to a single source on that assumption.
+    sandbox_base = local_skills_dirs[-1][1].rstrip("/")
 
     # Never write over content this path does not own: a planned skill whose
     # name an agent-installed or reconciler-linked skill already occupies is
@@ -1382,7 +1375,6 @@ async def _upload_skills(
         # every name it holds now reads as foreign. Stale skills that log a
         # warning every pass beat silently overwriting an agent's own files on
         # a transient download failure.
-        sandbox_base = local_skills_dirs[-1][1].rstrip("/")
         existing_dirs = {
             e.get("name")
             for e in (await sandbox.als_directory(sandbox_base) or [])
@@ -1407,25 +1399,37 @@ async def _upload_skills(
         logger.debug("No skills to upload after planning")
         return None, collisions
 
-    # ── Pass 2: Execute (minimal sandbox I/O) ──
-    # 1. Single rm for clean slate (all skill dirs that will be uploaded).
-    # Every surviving name is either lock-verified as ours or absent from the
-    # sandbox, so the rm only ever clears a dir this path is about to rewrite.
-    rm_targets = [plan.sandbox_dir for plan in final_skills.values()]
-    if rm_targets:
-        rm_cmd = "rm -rf " + " ".join(shlex.quote(d) for d in rm_targets)
-        await sandbox._runtime_call(
-            runtime.exec,
-            rm_cmd,
-            retry_policy=RetryPolicy.SAFE,
-        )
+    # Authoritative lock entries (platform + managed) from the manifest.
+    # Collision-skipped names stay OUT: their files are not written, so the
+    # lock must keep claiming the agent-installed entry, not the server one.
+    platform_entries = {}
+    for skill_name, skill_meta in manifest.get("skills", {}).items():
+        if skill_name in collisions:
+            continue
+        lock_entry = skill_meta.get("lock_entry")
+        if lock_entry:
+            platform_entries[skill_name] = lock_entry
 
-    # 2. Single mkdir for all skill dirs + subdirs
-    mkdir_targets: set[str] = set()
-    for plan in final_skills.values():
-        mkdir_targets.add(plan.sandbox_dir)
-        mkdir_targets.update(plan.subdirs)
-    if mkdir_targets:
+    # ── Pass 2: Execute (minimal sandbox I/O) ──
+    # Stage, then swap. A workspace link pass, on any worker, prunes every
+    # link the shared folder does not serve, so clearing a live dir before
+    # its upload would cost every workspace its link to that skill for the
+    # seconds the upload takes. The new bytes land in a hidden staging dir on
+    # the same filesystem and replace the live ones by rename. Every
+    # surviving name is either lock-verified as ours or absent from the
+    # sandbox, so the swap only ever displaces a dir this path is rewriting.
+
+    # Inline: skill_sync imports the skills lock module, whose package imports
+    # PTCSandbox, which imports this module.
+    from .skill_sync import install_staged_skills
+
+    staging = f"{sandbox_base}/.staging/sync-{token_hex(8)}"
+    try:
+        # 1. Single mkdir for all staged skill dirs + subdirs
+        mkdir_targets: set[str] = set()
+        for name, plan in final_skills.items():
+            mkdir_targets.add(f"{staging}/{name}")
+            mkdir_targets.update(f"{staging}/{name}/{d}" for d in plan.subdirs)
         mkdir_cmd = "mkdir -p " + " ".join(
             shlex.quote(d) for d in sorted(mkdir_targets)
         )
@@ -1435,68 +1439,63 @@ async def _upload_skills(
             retry_policy=RetryPolicy.SAFE,
         )
 
-    # 3. Parallel per-skill batch uploads — no race since planning collapsed duplicates
-    upload_coros = []
-    for plan in final_skills.values():
-        if plan.files:
-            batch = [(str(fp), dest) for fp, dest in plan.files]
-            upload_coros.append(
-                sandbox._runtime_call(
-                    runtime.upload_files,
-                    batch,
-                    retry_policy=RetryPolicy.SAFE,
+        # 2. Parallel per-skill batch uploads: no race, since planning
+        # collapsed duplicates
+        upload_coros = []
+        for name, plan in final_skills.items():
+            if plan.files:
+                batch = [(str(fp), f"{staging}/{name}/{rel}") for fp, rel in plan.files]
+                upload_coros.append(
+                    sandbox._runtime_call(
+                        runtime.upload_files,
+                        batch,
+                        retry_policy=RetryPolicy.SAFE,
+                    )
                 )
-            )
-    if upload_coros:
-        await asyncio.gather(*upload_coros)
+        if upload_coros:
+            await asyncio.gather(*upload_coros)
 
-    logger.debug(
-        "Uploaded skills to sandbox",
-        skill_count=len(final_skills),
-        file_count=len(manifest.get("files", {})),
-    )
-
-    # --- Lock file merge + write ---
-    # Build authoritative lock entries (platform + managed) from the manifest.
-    # Collision-skipped names stay OUT: their files were not written, so the
-    # lock must keep claiming the agent-installed entry, not the server one.
-    platform_entries = {}
-    skills_metadata = manifest.get("skills", {})
-    for skill_name, skill_meta in skills_metadata.items():
-        if skill_name in collisions:
-            continue
-        lock_entry = skill_meta.get("lock_entry")
-        if lock_entry:
-            platform_entries[skill_name] = lock_entry
-
-    if platform_entries or existing_lock:
-        # The write is a fresh read-merge-write inside the sandbox, under the
-        # same .skills-sync.flock the reconciler holds for its passes — a
+        # 3. One exec swaps every staged dir into place and merges the lock,
+        # both under the same .skills-sync.flock the reconciler holds for its
+        # passes. The merge is a fresh read-merge-write inside the sandbox: a
         # host-side merge over `existing_lock` would be a snapshot taken
         # before the multi-second prune/upload above, and writing it blind
         # would silently drop anything the reconciler committed in between
         # (whose next prune pass could then delete content the lock should
         # have protected).
-        from .skill_sync import merge_authoritative_entries
-
-        merged, lock_skipped = await merge_authoritative_entries(
-            sandbox, platform_entries
+        merged, lock_skipped = await install_staged_skills(
+            sandbox, staging, final_skills, platform_entries, base=sandbox_base
         )
-        if lock_skipped:
-            # A name this pass uploaded was claimed agent/linked since the
-            # collision check; the claim keeps the lock entry, and the
-            # reconciler's tree-hash check arbitrates the bytes next pass.
-            logger.warning(
-                "Skill lock entries ceded to concurrent agent/linked claims",
-                skills=sorted(lock_skipped),
+    except Exception:
+        # The install removes its staging dir itself; this covers a failure
+        # before or during it. A leftover is swept once it is an hour old.
+        try:
+            await sandbox._runtime_call(
+                runtime.exec,
+                f"rm -rf {shlex.quote(staging)}",
+                retry_policy=RetryPolicy.SAFE,
             )
-        logger.debug(
-            "Skills lock file merged",
-            platform_count=len(platform_entries),
-            user_count=sum(
-                1 for e in merged["skills"].values() if e.get("owner") == "user"
-            ),
-        )
-        return dict(merged), collisions
+        except Exception:
+            logger.debug("Could not remove skill staging dir", staging=staging)
+        raise
 
-    return None, collisions
+    if lock_skipped:
+        # Claimed agent/linked since the collision check: the claim keeps
+        # its bytes and its entry. Folded into the collisions so the caller's
+        # version stamp retries the name once the claim goes away.
+        logger.warning(
+            "Skill upload ceded to concurrent agent/linked claims",
+            skills=sorted(lock_skipped),
+        )
+        collisions = collisions | set(lock_skipped)
+
+    logger.debug(
+        "Uploaded skills to sandbox",
+        skill_count=len(final_skills),
+        file_count=len(manifest.get("files", {})),
+        platform_count=len(platform_entries),
+        user_count=sum(
+            1 for e in merged["skills"].values() if e.get("owner") == "user"
+        ),
+    )
+    return dict(merged), collisions

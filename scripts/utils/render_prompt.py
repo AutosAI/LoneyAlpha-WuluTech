@@ -6,9 +6,6 @@ Usage examples:
   # PTC system prompt with defaults
   python scripts/utils/render_prompt.py
 
-  # Flash mode
-  python scripts/utils/render_prompt.py --mode flash
-
   # The Chief of Staff (the agent in Home)
   python scripts/utils/render_prompt.py --role chief_of_staff
 
@@ -41,6 +38,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from ptc_agent.agent.context_stack import SubagentContext
+from ptc_agent.agent.middleware.runtime_context import BaselineSources, MemoryTierSource
 from ptc_agent.agent.prompts import (
     format_current_time,
     format_subagent_summary,
@@ -104,18 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
 
-    # Template selection
-    p.add_argument(
-        "--mode",
-        choices=["ptc", "flash"],
-        default="ptc",
-        help="Agent mode: ptc (full sandbox agent) or flash (lightweight). Default: ptc",
-    )
     p.add_argument(
         "--role",
         choices=["analyst", "chief_of_staff"],
         default="analyst",
-        help="PTC only: the workspace's analyst, or the Chief of Staff in Home. Default: analyst",
+        help="The workspace's analyst, or the Chief of Staff in Home. Default: analyst",
     )
     p.add_argument(
         "--subagent",
@@ -245,6 +237,27 @@ def resolve_guidance(args: argparse.Namespace) -> str:
     return args.guidance
 
 
+def _preview_subagent_context(args: argparse.Namespace) -> SubagentContext:
+    """A subagent context that reads nothing: its memory tier only tells the
+    compiler memory is there, for a subagent whose switch is on."""
+    return SubagentContext(
+        sources=BaselineSources(
+            store=object(),
+            memory={
+                "user": MemoryTierSource(
+                    namespace_factory=tuple,
+                    display_path=".agents/user/memory/memory.md",
+                )
+            },
+        ),
+        scratchpad=(
+            f"{DEFAULT_SANDBOX_ROOT}/.agents/scratchpad/{args.thread_id[:8]}/"
+            if args.scratchpad
+            else None
+        ),
+    )
+
+
 def render(args: argparse.Namespace) -> str:
     """Render the prompt based on CLI args."""
     now = datetime.now(tz=UTC)
@@ -288,18 +301,10 @@ def render(args: argparse.Namespace) -> str:
             tool_sets=stub_tool_sets,
             user_profile=user_profile,
             config=_PreviewConfig(guidance_vars["guidance"]),
+            context=_preview_subagent_context(args),
         )
         result = compiler.compile(defn)
         return result["system_prompt"]
-
-    if args.mode == "flash":
-        # Flash system prompt
-        return loader.render(
-            "flash_system.md.j2",
-            current_time=current_time,
-            user_profile=user_profile,
-            **guidance_vars,
-        )
 
     # The Chief of Staff always works in Home's folder, so its paths name it.
     layout_vars = (
@@ -403,10 +408,7 @@ def main() -> None:
     reset = "\033[0m" if use_color else ""
     bold = "\033[1m" if use_color else ""
 
-    if args.subagent:
-        label = f"subagent:{args.subagent}"
-    else:
-        label = args.mode
+    label = f"subagent:{args.subagent}" if args.subagent else args.role
 
     header = f"{dim}--- Rendered prompt: {bold}{label}{reset}{dim} ---{reset}"
     footer_parts = [f"chars: {len(result):,}"]

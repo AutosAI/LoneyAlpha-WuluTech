@@ -12,7 +12,7 @@ else may write a run's terminal state.
 import asyncio
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
 from uuid import uuid4
@@ -110,7 +110,6 @@ class RunHandle:
     thread_id: str
     turn_index: int
     attempt_no: int
-    msg_type: str  # 'ptc' | 'flash'
     workspace_id: Optional[str] = None
     user_id: Optional[str] = None
     is_byok: bool = False
@@ -183,7 +182,6 @@ class RunCoordinator:
         *,
         thread_id: str,
         run_id: str,
-        msg_type: str,
         request_key: Optional[str] = None,
         workspace_id: Optional[str] = None,
         user_id: Optional[str] = None,
@@ -218,11 +216,17 @@ class RunCoordinator:
         """
         from src.server.services import writer_guard as wg
 
+        # START stamps the producer on the run and on its query row, so no
+        # caller names it: the full agent is the only one left.
         metadata = {
-            "msg_type": msg_type,
+            "msg_type": "ptc",
             **(run_metadata or {}),
             **untaken_input_metadata(pending_input or {}),
         }
+        if query is not None:
+            query = replace(
+                query, metadata={"msg_type": "ptc", **(query.metadata or {})}
+            )
         # START-stamp identity onto the durable row: finalize/recovery paths
         # build the user-feed event from row metadata alone, with no in-process
         # context surviving a crash (user_id names the channel, workspace_id
@@ -262,7 +266,6 @@ class RunCoordinator:
                 thread_id=thread_id,
                 turn_index=row["turn_index"],
                 attempt_no=row["attempt_no"],
-                msg_type=msg_type,
                 workspace_id=workspace_id,
                 user_id=user_id,
                 is_byok=is_byok,
@@ -368,6 +371,14 @@ class RunCoordinator:
                     exc_info=True,
                 )
                 newest, newest_read = None, False
+
+            # Outside the mutex: a checkpoint read and an outbox write, which
+            # need nothing of the guard's session.
+            from src.server.services.report_back.steer import (
+                confirm_checkpointed_holds,
+            )
+
+            await confirm_checkpointed_holds(handle.thread_id, handle.run_id)
 
             usage_writer = None
             if outcome.per_call_records or outcome.tool_usage:
@@ -491,6 +502,9 @@ class RunCoordinator:
         """
         if outcome.status == "error":
             outcome = _with_detached_failure_kind(outcome)
+        from src.server.services.report_back.steer import confirm_checkpointed_holds
+
+        await confirm_checkpointed_holds(thread_id, run_id)
         result = await tl_db.finalize_run(
             run_id=run_id,
             thread_id=thread_id,
@@ -687,13 +701,10 @@ class RunCoordinator:
                 await usage.track_llm_usage(outcome.per_call_records)
             if outcome.tool_usage:
                 usage.record_tool_usage_batch(outcome.tool_usage)
-            # msg_type is the producer mode, never a status — interrupted
-            # turns bill as their real mode ('interrupted' rows were the old
-            # vocabulary pollution). final_status comes from the CAS row, not
-            # outcome.status: durable cancel intent may have overridden it.
+            # final_status comes from the CAS row, not outcome.status: durable
+            # cancel intent may have overridden it.
             ok = await usage.persist_usage(
                 response_id=handle.run_id,
-                msg_type=outcome.metadata.get("msg_type") or handle.msg_type,
                 deepthinking=outcome.metadata.get("deepthinking", False),
                 status=final_status,
                 conn=conn,
@@ -736,7 +747,7 @@ class RunCoordinator:
         transcript."""
         self._schedule_replay_refresh(thread_id)
         self._schedule_transcript_export(thread_id, run)
-        self._schedule_archive_prune(thread_id, run)
+        self._schedule_archive_prune(thread_id)
         self._nudge_hook_drainer()
 
     def _nudge_hook_drainer(self) -> None:
@@ -763,15 +774,10 @@ class RunCoordinator:
                 exc_info=True,
             )
 
-    def _schedule_archive_prune(
-        self, thread_id: str, run: Optional[Dict[str, Any]]
-    ) -> None:
+    def _schedule_archive_prune(self, thread_id: str) -> None:
         # An archived thread keeps its scratchpad while a run writes to it,
         # and nothing else asks for the prune once that run ends.
         try:
-            meta = (run or {}).get("metadata") or {}
-            if meta.get("msg_type") != "ptc":
-                return
             from src.server.services.workspace_manager import prune_if_archived_soon
 
             prune_if_archived_soon(thread_id)
@@ -784,13 +790,10 @@ class RunCoordinator:
     def _schedule_transcript_export(
         self, thread_id: str, run: Optional[Dict[str, Any]]
     ) -> None:
-        # The mode comes from the row's START stamp, which a detached
-        # finalize has without the run's process. A Flash workspace has no
-        # computer to serve a transcript.
+        # The workspace comes from the row's START stamp, which a detached
+        # finalize has without the run's process.
         try:
             meta = (run or {}).get("metadata") or {}
-            if meta.get("msg_type") != "ptc":
-                return
             from src.server.services.transcripts import schedule_thread_export
 
             schedule_thread_export(thread_id, meta.get("workspace_id"))

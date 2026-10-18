@@ -7,6 +7,7 @@ import {
   computeAgentArtifactRouting,
   computerFolders,
   isAgentNotesPath,
+  isSubagentFilePath,
   isUserDataReadmePath,
   normalizeAgentHref,
   normalizeAgentPath,
@@ -487,6 +488,34 @@ describe('isUserDataReadmePath', () => {
   });
 });
 
+describe('isSubagentFilePath', () => {
+  it('matches a subagent file under any prefix the agent emits', () => {
+    expect(isSubagentFilePath('.agents/user/agents/research.md')).toBe(true);
+    expect(isSubagentFilePath('/home/workspace/.agents/user/agents/research.md')).toBe(true);
+    expect(isSubagentFilePath('home/daytona/.agents/user/agents/filings-reader.md')).toBe(true);
+    expect(isSubagentFilePath('file:///home/workspace/.agents/user/agents/research.md')).toBe(true);
+    expect(isSubagentFilePath('./.agents/user/agents/research.md')).toBe(true);
+    expect(isSubagentFilePath('__wsref__/ws-7/.agents/user/agents/research.md')).toBe(true);
+  });
+
+  it('does not match the README, a nested file, or a name the server refuses', () => {
+    expect(isSubagentFilePath('.agents/user/agents/README.md')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/agents/drafts/research.md')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/agents/')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/agents/Research.md')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/agents/research.md.tmp')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/agents/-research.md')).toBe(false);
+  });
+
+  it('does not match other files', () => {
+    expect(isSubagentFilePath('research.md')).toBe(false);
+    expect(isSubagentFilePath('work/.agents/user/agents/research.md')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/automations/research.md')).toBe(false);
+    expect(isSubagentFilePath('.agents/user/memory/research.md')).toBe(false);
+    expect(isSubagentFilePath('')).toBe(false);
+  });
+});
+
 describe('isAgentNotesPath', () => {
   const notes = (raw: string, dir?: string | null) => isAgentNotesPath(parseAgentPath(raw), dir);
 
@@ -696,7 +725,7 @@ describe('computerFolders', () => {
   const rows = [
     { workspace_id: 'ws-aapl', computer_id: 'c1', dir_name: 'AAPL', previous_dir_names: ['apple-old'] },
     { workspace_id: 'ws-nvda', computer_id: 'c1', dir_name: 'NVDA', previous_dir_names: ['nvidia-ab12'] },
-    { workspace_id: 'ws-home', computer_id: 'c1', dir_name: 'Home', status: 'flash' },
+    { workspace_id: 'ws-home', computer_id: 'c1', dir_name: 'Home', is_home: true, status: 'running' },
     { workspace_id: 'ws-gone', computer_id: 'c1', dir_name: 'Gone', status: 'deleted' },
     { workspace_id: 'ws-new', computer_id: 'c1', dir_name: null },
     { workspace_id: 'ws-msft', computer_id: 'c2', dir_name: 'MSFT' },

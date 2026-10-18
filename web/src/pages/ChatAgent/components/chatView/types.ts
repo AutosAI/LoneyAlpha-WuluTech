@@ -6,7 +6,6 @@ import type { SubagentTokenUsage } from '../../utils/tokenUsage';
 export type { MessageRecord } from '../../hooks/utils/types';
 
 export interface LocationState {
-  agentMode?: string;
   workspaceStatus?: string | null;
   initialMessage?: string;
   additionalContext?: Record<string, unknown>[] | null;
@@ -18,6 +17,11 @@ export interface LocationState {
    * the thread that send starts. Absent leaves it to the user's default.
    */
   subagentsAllowed?: boolean;
+  /**
+   * Text to leave in the composer, unsent, for the user to finish: "Set up a
+   * subagent that ". Ignored alongside `initialMessage`, which is sent.
+   */
+  draftMessage?: string;
   /** Open with the onboarding interview's first turn (from the connect sheet). */
   isOnboarding?: boolean;
   /** The brokerages connected on the way in, by label, for that first turn. */
